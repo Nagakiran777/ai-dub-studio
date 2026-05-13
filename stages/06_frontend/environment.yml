@@ -1,0 +1,16 @@
+name: dub_frontend
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - PyQt6==6.7.0
+    - PyQt6-Qt6==6.7.0
+    - PyQt6-sip==13.6.0
+    - pyyaml==6.0.1
+    - librosa==0.10.2.post1
+    - soundfile==0.12.1
+    - "numpy<2.0"
+    - scipy==1.13.1

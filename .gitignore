@@ -1,0 +1,23 @@
+# Personal data — never push
+data/audio/
+data/input/
+data/outputs/
+jobs/
+logs/
+models/
+.env
+step-prompt/
+
+# Docker
+docker/Miniforge3-Linux-x86_64.sh
+conda_envs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

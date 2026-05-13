@@ -1,0 +1,6 @@
+name: dub_tts
+channels:
+  - defaults
+dependencies:
+  - python=3.11.14
+  - pip

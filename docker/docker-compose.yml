@@ -1,0 +1,62 @@
+# =============================================================================
+# AI Dub Studio — docker-compose.yml
+# Run with: docker-compose up --build
+# =============================================================================
+
+version: "3.8"
+
+services:
+  ai-dub-studio:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ai-dub-studio:latest
+    container_name: ai-dub-studio
+
+    # ── GPU access ──────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # ── Environment variables ───────────────────────────────────────────────
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_QPA_PLATFORM=xcb
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - HF_HOME=/cache/hf_cache
+      - TRANSFORMERS_CACHE=/cache/hf_cache
+      - HF_DATASETS_CACHE=/cache/hf_cache/datasets
+      - TORCH_HOME=/cache/torch_cache
+      - WHISPER_CACHE=/cache/whisper_cache
+
+    # ── Volume mounts ───────────────────────────────────────────────────────
+    # Model caches — mounted from host, NOT baked into image
+    # Change these paths to match your system
+    volumes:
+      # Model caches (read-write so models can be downloaded)
+      - ${HF_HOME:-/mnt/d/$/dub_requirements/hf_cache}:/cache/hf_cache
+      - ${TORCH_HOME:-/mnt/d/$/dub_requirements/torch_cache}:/cache/torch_cache
+      - ${WHISPER_CACHE:-/mnt/d/$/dub_requirements/whisper_cache}:/cache/whisper_cache
+
+      # Project data (input videos, outputs, jobs)
+      - ../data:/app/data
+      - ../jobs:/app/jobs
+      - ../logs:/app/logs
+
+      # X11 display for GUI (Linux/WSL2)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # ── Network ─────────────────────────────────────────────────────────────
+    network_mode: host
+
+    # ── Interactive mode ─────────────────────────────────────────────────────
+    stdin_open: true
+    tty: true
+
+    # ── Restart policy ───────────────────────────────────────────────────────
+    restart: unless-stopped
