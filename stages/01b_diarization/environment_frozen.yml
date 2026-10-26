@@ -2,38 +2,38 @@ name: dub_diar
 channels:
   - defaults
 dependencies:
-  - _libgcc_mutex=0.1=main
-  - _openmp_mutex=5.1=1_gnu
-  - bzip2=1.0.8=h5eee18b_6
-  - ca-certificates=2026.3.19=h06a4308_0
-  - ld_impl_linux-64=2.44=h9e0c5a2_3
-  - libexpat=2.7.5=h7354ed3_0
-  - libffi=3.4.4=h6a678d5_1
-  - libgcc=15.2.0=h69a1729_7
-  - libgcc-ng=15.2.0=h166f726_7
-  - libgomp=15.2.0=h4751f2c_7
-  - libnsl=2.0.0=h5eee18b_0
-  - libstdcxx=15.2.0=h39759b7_7
-  - libstdcxx-ng=15.2.0=hc03a8fd_7
-  - libuuid=1.41.5=h5eee18b_0
-  - libxcb=1.17.0=h9b100fa_0
-  - libzlib=1.3.1=hb25bd0a_0
-  - ncurses=6.5=h7934f7d_0
-  - openssl=3.5.5=h1b28b03_0
-  - pip=26.0.1=pyhc872135_1
-  - pthread-stubs=0.3=h0ce48e5_1
-  - python=3.10.20=h741d88c_0
-  - readline=8.3=hc2a1206_0
-  - setuptools=82.0.1=py310h06a4308_0
-  - sqlite=3.51.2=h3e8d24a_0
-  - tk=8.6.15=h54e0aa7_0
-  - wheel=0.46.3=py310h06a4308_0
-  - xorg-libx11=1.8.12=h9b100fa_1
-  - xorg-libxau=1.0.12=h9b100fa_0
-  - xorg-libxdmcp=1.1.5=h9b100fa_0
-  - xorg-xorgproto=2024.1=h5eee18b_1
-  - xz=5.8.2=h448239c_0
-  - zlib=1.3.1=hb25bd0a_0
+  - _libgcc_mutex=0.1
+  - _openmp_mutex=5.1
+  - bzip2=1.0.8
+  - ca-certificates=2026.3.19
+  - ld_impl_linux-64=2.44
+  - libexpat=2.7.5
+  - libffi=3.4.4
+  - libgcc=15.2.0
+  - libgcc-ng=15.2.0
+  - libgomp=15.2.0
+  - libnsl=2.0.0
+  - libstdcxx=15.2.0
+  - libstdcxx-ng=15.2.0
+  - libuuid=1.41.5
+  - libxcb=1.17.0
+  - libzlib=1.3.1
+  - ncurses=6.5
+  - openssl=3.5.5
+  - pip=26.0.1
+  - pthread-stubs=0.3
+  - python=3.10.20
+  - readline=8.3
+  - setuptools=82.0.1
+  - sqlite=3.51.2
+  - tk=8.6.15
+  - wheel=0.46.3
+  - xorg-libx11=1.8.12
+  - xorg-libxau=1.0.12
+  - xorg-libxdmcp=1.1.5
+  - xorg-xorgproto=2024.1
+  - xz=5.8.2
+  - zlib=1.3.1
   - pip:
       - absl-py==2.4.0
       - accelerate==1.13.0
@@ -41,9 +41,11 @@ dependencies:
       - aiohttp==3.13.5
       - aiosignal==1.4.0
       - alembic==1.18.4
+      - annotated-doc==0.0.4
       - annotated-types==0.7.0
       - antlr4-python3-runtime==4.9.3
       - anyio==4.13.0
+      - asteroid-filterbanks==0.4.0
       - asttokens==3.0.1
       - async-timeout==5.0.1
       - attrs==26.1.0
@@ -66,6 +68,7 @@ dependencies:
       - decorator==5.2.1
       - dill==0.4.1
       - diskcache==5.6.3
+      - docopt==0.6.2
       - editdistance==0.8.1
       - einops==0.8.2
       - exceptiongroup==1.3.1
@@ -86,6 +89,7 @@ dependencies:
       - httpx==0.28.1
       - huggingface-hub==0.36.2
       - hydra-core==1.3.2
+      - hyperpyyaml==1.2.3
       - idna==3.11
       - indic-numtowords==1.1.0
       - inflect==7.5.0
@@ -95,6 +99,7 @@ dependencies:
       - jinja2==3.1.6
       - jiwer==3.1.0
       - joblib==1.5.3
+      - julius==0.2.8
       - kaldi-python-io==1.2.2
       - kaldialign==0.9.1
       - kiwisolver==1.5.0
@@ -109,10 +114,12 @@ dependencies:
       - lxml==6.0.2
       - mako==1.3.10
       - markdown==3.10.2
+      - markdown-it-py==4.2.0
       - markupsafe==3.0.3
       - marshmallow==4.3.0
       - matplotlib==3.10.8
       - matplotlib-inline==0.2.1
+      - mdurl==0.1.2
       - mediapy==1.1.6
       - ml-dtypes==0.5.4
       - more-itertools==11.0.1
@@ -154,15 +161,18 @@ dependencies:
       - platformdirs==4.9.4
       - pooch==1.9.0
       - portalocker==3.2.0
+      - primepy==1.3
       - prompt-toolkit==3.0.52
       - propcache==0.4.1
       - protobuf==5.29.6
       - psutil==7.2.2
       - ptyprocess==0.7.0
       - pure-eval==0.2.3
-      - pyannote-core==6.0.1
-      - pyannote-database==6.1.1
-      - pyannote-metrics==4.0.0
+      - pyannote-audio==3.4.0
+      - pyannote-core==5.0.0
+      - pyannote-database==5.1.3
+      - pyannote-metrics==3.2.1
+      - pyannote-pipeline==3.0.1
       - pyarrow==23.0.1
       - pycparser==3.0
       - pydantic==2.12.5
@@ -174,26 +184,32 @@ dependencies:
       - python-dateutil==2.9.0.post0
       - python-dotenv==1.2.2
       - pytorch-lightning==2.6.1
+      - pytorch-metric-learning==2.9.0
       - pytz==2026.1.post1
       - pyyaml==6.0.3
       - rapidfuzz==3.14.3
       - regex==2026.4.4
       - requests==2.33.1
       - resampy==0.4.3
-      - ruamel-yaml==0.19.1
+      - rich==15.0.0
+      - ruamel-yaml==0.18.17
+      - ruamel-yaml-clib==0.2.15
       - sacrebleu==2.6.0
       - sacremoses==0.1.1
       - safetensors==0.7.0
       - scikit-learn==1.7.2
       - scipy==1.15.3
+      - semver==3.0.4
       - sentencepiece==0.2.1
       - sentry-sdk==2.57.0
+      - shellingham==1.5.4
       - six==1.17.0
       - smmap==5.0.3
       - sortedcontainers==2.4.0
       - soundfile==0.13.1
       - sox==1.5.0
       - soxr==1.0.0
+      - speechbrain==1.1.0
       - sqlalchemy==2.0.49
       - stack-data==0.6.3
       - strenum==0.4.15
@@ -201,20 +217,24 @@ dependencies:
       - tabulate==0.10.0
       - tensorboard==2.20.0
       - tensorboard-data-server==0.7.2
+      - tensorboardx==2.6.5
       - text-unidecode==1.3
       - threadpoolctl==3.6.0
       - tokenizers==0.22.2
       - toml==0.10.2
       - tomli==2.4.1
       - toolz==1.1.0
-      - torch==2.6.0+cu124
-      - torchaudio==2.6.0+cu124
+      - torch==2.5.1+cu124
+      - torch-audiomentations==0.12.0
+      - torch-pitch-shift==1.2.5
+      - torchaudio==2.5.1+cu124
       - torchmetrics==1.9.0
       - tqdm==4.67.3
       - traitlets==5.14.3
       - transformers==4.57.6
-      - triton==3.2.0
+      - triton==3.1.0
       - typeguard==4.5.1
+      - typer==0.26.7
       - typing-extensions==4.15.0
       - typing-inspection==0.4.2
       - tzdata==2026.1
@@ -228,4 +248,3 @@ dependencies:
       - wrapt==2.1.2
       - xxhash==3.6.0
       - yarl==1.23.0
-prefix: /home/jani/miniconda3/envs/dub_diar
