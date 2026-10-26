@@ -38,6 +38,7 @@ def create_job(input_video: str, config: dict) -> str:
     job_meta = {
         "job_id":      job_id,
         "input_video": str(Path(input_video).resolve()),
+        "input_file":  str(Path(input_video).resolve()),
         "video_name":  video_name,
         "created_at":  datetime.now().isoformat(),
         "source_lang": config["language"]["source"],
@@ -61,14 +62,13 @@ def load_manifest(job_id: str, config: dict) -> dict:
         with open(manifest_path, "r") as f:
             return json.load(f)
 
-    # Default manifest — all stages pending
+    # Default manifest — all stages pending (02_emotion removed)
     manifest = {
         "job_id": job_id,
         "stages": {
             "00_vocals":        {"status": "pending", "completed_at": None, "failed_at": None},
             "01_asr":           {"status": "pending", "completed_at": None, "failed_at": None},
             "01b_diarization":  {"status": "pending", "completed_at": None, "failed_at": None},
-            "02_emotion":       {"status": "pending", "completed_at": None, "failed_at": None},
             "03_translation":   {"status": "pending", "completed_at": None, "failed_at": None},
             "04_tts":           {"status": "pending", "completed_at": None, "failed_at": None},
             "05_assembly":      {"status": "pending", "completed_at": None, "failed_at": None},
@@ -151,16 +151,11 @@ def get_stage_config_key(stage: str) -> str:
         "00_vocals"       -> "vocals"
         "01_asr"          -> "asr"
         "01b_diarization" -> "diarization"
-        "02_emotion"      -> "emotion"
         "03_translation"  -> "translation"
         "04_tts"          -> "tts"
         "05_assembly"     -> "assembly"
-
-    Rule: strip leading segment up to and including first underscore
-    that follows digits (with optional letter suffix like 'b').
     """
     import re
-    # Match leading pattern like "00_", "01_", "01b_", "05_"
     match = re.match(r'^\d+[a-z]?_', stage)
     if match:
         return stage[match.end():]

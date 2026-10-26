@@ -10,23 +10,23 @@ project:
 # PATHS
 # ============================================================
 paths:
-  data_input:  "data/input"
-  data_audio:  "data/audio"
-  data_output: "data/outputs"
-  jobs:        "jobs"
+  data_input:   "data/input"
+  data_audio:   "data/audio"
+  data_output:  "data/outputs"
+  jobs:         "jobs"
   models_cache: "models/cache"
-  logs:        "logs"
-  stages:      "stages"
+  logs:         "logs"
+  stages:       "stages"
 
 # ============================================================
 # LANGUAGE SETTINGS
 # ============================================================
 language:
-  source:           "auto"
-  bridge:           "en"
-  target:           "en"
-  target_name:      "English"
-  code_mixing:      false
+  source:            "auto"
+  bridge:            "en"
+  target:            "en"
+  target_name:       "English"
+  code_mixing:       false
   code_mixing_style: "tenglish"
 
 # ============================================================
@@ -44,49 +44,43 @@ hardware:
 # ============================================================
 stages:
 
+  # ----------------------------------------------------------
+  # STAGE 00 — Vocal Separation (BS-Roformer only)
+  # ----------------------------------------------------------
   vocals:
-    env_name:      "dub_vocals"
-    demucs_model:  "mdx_extra_q"
-    sample_rate:   16000
+    env_name:          "dub_vocals"
+    bs_roformer_model: "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+    model_cache_dir:   "/mnt/d/$/dub_requirements/hf_cache/audio_separator_models"
 
+  # ----------------------------------------------------------
+  # STAGE 01 — ASR (Speech Recognition)
+  # ----------------------------------------------------------
   asr:
-    env_name:       "dub_asr"
-    model:          "medium"
-    device:         "cuda"
-    compute_type:   "int8_float16"
-    language:       "en"
-    word_timestamps: true
-    chunk_size:     10
-    min_silence_ms: 400
-    min_segment_duration_s: 1.0
-    min_segment_words: 3
+    env_name:                     "dub_asr"
+    model:                        "large-v3"
+    device:                       "cuda"
+    language:                     "en"
+    temperature:                  0.0
+    logprob_threshold:           -1.0
+    no_speech_threshold:          0.6
+    condition_on_previous_text:   false
+    compression_ratio_threshold:  2.4
 
+  # ----------------------------------------------------------
+  # STAGE 01b — Speaker Diarization
+  # ----------------------------------------------------------
   diarization:
     env_name:               "dub_diar"
     device:                 "cuda"
     max_num_speakers:       50
-    distance_threshold:     0.75
+    distance_threshold:     0.60
     speaker_profile_min_s:  3.0
     speaker_profile_max_s:  10000.0
+    hf_token:               ""
 
-  emotion:
-    env_name:     "dub_emotion"
-    acoustic_model: "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
-    audio_model:  "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
-    text_model:   "j-hartmann/emotion-english-distilroberta-base"
-    audio_weight: 0.65
-    text_weight:  0.35
-    device:       "cuda"
-    labels:
-      - "neutral"
-      - "calm"
-      - "happy"
-      - "sad"
-      - "angry"
-      - "fearful"
-      - "surprised"
-      - "disgusted"
-
+  # ----------------------------------------------------------
+  # STAGE 03 — Translation
+  # ----------------------------------------------------------
   translation:
     env_name:    "dub_translate"
     model:       "ai4bharat/indictrans2-en-indic-dist-200M"
@@ -98,40 +92,27 @@ stages:
       - loanwords
       - short_neutral_words
 
+  # ----------------------------------------------------------
+  # STAGE 04 — TTS (Voice Synthesis)
+  # Ref audio: dialogue slice from _vocals.wav (>= min_ref_duration_s)
+  # Fallback:  speaker_profiles/speaker_XX.wav if dialogue too short
+  # ----------------------------------------------------------
   tts:
-    env_name:   "dub_tts"
-    model:      "tts_models/multilingual/multi-dataset/xtts_v2"
-    device:     "cuda"
-    sample_rate: 22050
+    env_name:           "dub_tts"
+    model:              "drbaph/OmniVoice-bf16"
+    device:             "cuda"
+    sample_rate:        24000
+    min_ref_duration_s: 1.0
 
-    # Reference audio settings
-    # Dialogue clip from vocals WAV is used first (captures emotion naturally)
-    # Falls back to speaker profile if clip is shorter than min_ref_duration_s
-    min_ref_duration_s: 3.0     # Minimum clip length for reliable voice cloning
-
-    # Time stretch limits
-    # ratio = target_duration / synthesized_duration
-    # > 1.0 = slow down (synthesized shorter than slot)
-    # < 1.0 = speed up  (synthesized longer than slot)
-    min_stretch_ratio: 0.7
-    max_stretch_ratio: 1.5
-
-    # Chatterbox Turbo specific parameters
-    # exaggeration: mapped automatically from emotion intensity (0.3 → 0.9)
-    # 0.3 = flat/calm delivery   (low intensity dialogues)
-    # 0.9 = very expressive      (high intensity dialogues)
-    exaggeration_min: 0.3
-    exaggeration_max: 0.9
-
-    # cfg_weight: controls how faithful the model stays to the reference voice
-    # Higher = more faithful clone. 3.0 is a good balance for dubbing.
-    cfg_weight: 3.0
-
+  # ----------------------------------------------------------
+  # STAGE 05 — Assembly
+  # Background: {job_id}_no_vocals.wav (BS-Roformer BGM+SFX)
+  # ----------------------------------------------------------
   assembly:
-    env_name:    "dub_assembly"
-    sample_rate: 22050           # Updated to match Chatterbox Turbo output
+    env_name:               "dub_assembly"
+    sample_rate:            24000
     timestamp_tolerance_ms: 80
-    fade_ms:     10
+    fade_ms:                10
     nonlexical_sounds:
       - "hmm"
       - "uh"
@@ -153,7 +134,6 @@ pipeline:
     - "00_vocals"
     - "01_asr"
     - "01b_diarization"
-    - "02_emotion"
     - "03_translation"
     - "04_tts"
     - "05_assembly"

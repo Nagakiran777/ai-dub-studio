@@ -23,3 +23,10 @@ __pycache__/
 Thumbs.db
 
 # Allow frontend Python models module
+
+# Web frontend generated files
+**/node_modules/
+**/dist/
+
+# Environment files and secrets
+.env*

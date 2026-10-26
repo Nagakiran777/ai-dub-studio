@@ -4,11 +4,11 @@ Stage 01b — Speaker Diarization
 ================================
 Approach:
     - Read dialogue timestamps from 01_transcription.json
-    - Slice original audio at each dialogue boundary
+    - Slice {job_id}_vocals.wav at each dialogue boundary  ← KEY FIX (was original audio)
     - Extract TitaNet speaker embeddings per dialogue
     - Cluster embeddings using AgglomerativeClustering (auto speaker count)
     - Assign speaker IDs to dialogues and words
-    - Extract speaker reference profiles from vocals WAV for Stage 04
+    - Speaker profile extraction remains disabled (built by UI button)
 
 No NeMo pipeline used — only TitaNet embeddings directly.
 No VAD, no full diarization pipeline, no source patching needed.
@@ -122,8 +122,8 @@ def load_audio_slice(
     Returns None if slice is too short (< 0.5s).
     """
     start_sample = int(start_ms / 1000 * sr)
-    end_sample = int(end_ms / 1000 * sr)
-    end_sample = min(end_sample, audio.shape[1])
+    end_sample   = int(end_ms   / 1000 * sr)
+    end_sample   = min(end_sample, audio.shape[1])
     start_sample = max(0, start_sample)
 
     if end_sample <= start_sample:
@@ -161,14 +161,14 @@ def extract_embeddings(
         embeddings: list of 192-dim numpy arrays
         valid_indices: indices into dialogues list that were successfully processed
     """
-    embeddings = []
+    embeddings    = []
     valid_indices = []
 
     for idx, dlg in enumerate(dialogues):
         slice_audio = load_audio_slice(
             audio, sr,
             dlg.get("start_ms", 0),
-            dlg.get("end_ms", 0),
+            dlg.get("end_ms",   0),
         )
 
         if slice_audio is None:
@@ -233,7 +233,7 @@ def cluster_speakers(
         metric="cosine",
         linkage="average",
     )
-    labels = clustering.fit_predict(emb_matrix)
+    labels     = clustering.fit_predict(emb_matrix)
     n_detected = len(set(labels))
 
     logger.info(
@@ -258,7 +258,7 @@ def cluster_speakers(
 
 
 # ---------------------------------------------------------------------------
-# Speaker profile extraction
+# Speaker profile extraction  (DISABLED — built by UI button)
 # ---------------------------------------------------------------------------
 
 def extract_speaker_profiles(
@@ -284,7 +284,6 @@ def extract_speaker_profiles(
     profiles_dir.mkdir(parents=True, exist_ok=True)
     saved: Dict[str, Path] = {}
 
-    # Convert vocals to mono numpy if needed
     vocals_np = vocals_audio.numpy()
     if vocals_np.ndim > 1:
         vocals_np = vocals_np.mean(axis=0)
@@ -293,7 +292,6 @@ def extract_speaker_profiles(
     min_samples = int(min_s * vocals_sr)
 
     for speaker_id, segments in speaker_segments.items():
-        # Sort by duration descending
         segments_sorted = sorted(
             segments,
             key=lambda s: s["end_ms"] - s["start_ms"],
@@ -307,11 +305,11 @@ def extract_speaker_profiles(
             if total_samples >= max_samples:
                 break
             start_sample = int(seg["start_ms"] / 1000 * vocals_sr)
-            end_sample = int(seg["end_ms"] / 1000 * vocals_sr)
+            end_sample   = int(seg["end_ms"]   / 1000 * vocals_sr)
             start_sample = max(0, min(start_sample, len(vocals_np) - 1))
-            end_sample = max(start_sample + 1, min(end_sample, len(vocals_np)))
-            chunk = vocals_np[start_sample:end_sample]
-            remaining = max_samples - total_samples
+            end_sample   = max(start_sample + 1, min(end_sample, len(vocals_np)))
+            chunk        = vocals_np[start_sample:end_sample]
+            remaining    = max_samples - total_samples
             if len(chunk) > remaining:
                 chunk = chunk[:remaining]
             chunks.append(chunk)
@@ -324,14 +322,12 @@ def extract_speaker_profiles(
             )
             continue
 
-        profile = np.concatenate(chunks)
+        profile  = np.concatenate(chunks)
         duration = len(profile) / vocals_sr
 
-        # Skip if effectively silent / zero duration
         if len(profile) == 0 or duration < 0.1:
             logger.warning(
-                "%s profile has zero/near-zero duration — skipping",
-                speaker_id,
+                "%s profile has zero/near-zero duration — skipping", speaker_id,
             )
             continue
 
@@ -341,7 +337,6 @@ def extract_speaker_profiles(
                 speaker_id, duration, min_s,
             )
 
-        # Resample to 16kHz if needed (Stage 04 TTS expects 16kHz)
         target_sr = 16000
         if vocals_sr != target_sr:
             profile_tensor = torch.tensor(profile).unsqueeze(0)
@@ -350,8 +345,7 @@ def extract_speaker_profiles(
             )
             profile = profile_tensor.squeeze(0).numpy()
             logger.debug(
-                "%s resampled from %dHz to %dHz",
-                speaker_id, vocals_sr, target_sr,
+                "%s resampled from %dHz to %dHz", speaker_id, vocals_sr, target_sr,
             )
 
         out_path = profiles_dir / f"{speaker_id}.wav"
@@ -370,18 +364,18 @@ def extract_speaker_profiles(
 # ---------------------------------------------------------------------------
 
 def run_diarization(job_id: str, config_path: str) -> None:
-    cfg = load_config(config_path)
+    cfg          = load_config(config_path)
     project_root = Path(config_path).parent.resolve()
 
-    jobs_dir = project_root / cfg["paths"]["jobs"]
-    job_dir = jobs_dir / job_id
-    logs_dir = project_root / cfg["paths"]["logs"]
-    audio_dir = project_root / cfg["paths"]["data_audio"]
+    jobs_dir           = project_root / cfg["paths"]["jobs"]
+    job_dir            = jobs_dir / job_id
+    logs_dir           = project_root / cfg["paths"]["logs"]
+    audio_dir          = project_root / cfg["paths"]["data_audio"]
 
     transcription_path = job_dir / "01_transcription.json"
-    manifest_path = job_dir / "manifest.json"
-    profiles_dir = job_dir / "speaker_profiles"
-    log_path = logs_dir / f"{job_id}_01b_diarization.log"
+    manifest_path      = job_dir / "manifest.json"
+    profiles_dir       = job_dir / "speaker_profiles"
+    log_path           = logs_dir / f"{job_id}_01b_diarization.log"
 
     logger = setup_logging(log_path)
     logger.info("=" * 60)
@@ -412,39 +406,41 @@ def run_diarization(job_id: str, config_path: str) -> None:
         mark_manifest(manifest_path, "01b_diarization", success=True, note="no dialogues")
         return
 
-    # Locate original audio (for embeddings)
-    original_audio_path = audio_dir / f"{job_id}.wav"
-    if not original_audio_path.exists():
-        logger.error("Original audio not found: %s", original_audio_path)
+    # ── KEY FIX: use _vocals.wav for embeddings (clean, no BGM) ──────────────
+    vocals_path = audio_dir / f"{job_id}_vocals.wav"
+    if not vocals_path.exists():
+        logger.warning("Vocals WAV not found — falling back to original audio")
+        vocals_path = audio_dir / f"{job_id}.wav"
+    if not vocals_path.exists():
+        logger.error("No audio found for diarization: %s", vocals_path)
         sys.exit(1)
 
     # Locate vocals audio (for speaker profiles)
-    vocals_path = audio_dir / f"{job_id}_vocals.wav"
-    if not vocals_path.exists():
-        logger.warning("Vocals WAV not found — using original audio for profiles too")
-        vocals_path = original_audio_path
+    vocals_profile_path = audio_dir / f"{job_id}_vocals.wav"
+    if not vocals_profile_path.exists():
+        vocals_profile_path = vocals_path
 
     # Diarization config
-    diar_cfg = cfg.get("stages", {}).get("diarization", {})
-    device_str = diar_cfg.get("device", "cuda")
+    diar_cfg           = cfg.get("stages", {}).get("diarization", {})
+    device_str         = diar_cfg.get("device", "cuda")
     if device_str == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA not available — falling back to CPU")
         device_str = "cpu"
 
-    max_speakers = int(diar_cfg.get("max_num_speakers", 8))
-    distance_threshold = float(diar_cfg.get("distance_threshold", 0.7))
-    min_profile_s = float(diar_cfg.get("speaker_profile_min_s", 3.0))
-    max_profile_s = float(diar_cfg.get("speaker_profile_max_s", 10.0))
+    max_speakers       = int(diar_cfg.get("max_num_speakers", 50))
+    distance_threshold = float(diar_cfg.get("distance_threshold", 0.75))
+    min_profile_s      = float(diar_cfg.get("speaker_profile_min_s", 3.0))
+    max_profile_s      = float(diar_cfg.get("speaker_profile_max_s", 10000.0))
 
     # -----------------------------------------------------------------------
     # Load audio
     # -----------------------------------------------------------------------
-    logger.info("Loading original audio: %s", original_audio_path)
-    audio, sr = torchaudio.load(str(original_audio_path))
+    logger.info("Loading vocals audio for embeddings: %s", vocals_path)
+    audio, sr = torchaudio.load(str(vocals_path))
     logger.info("Audio shape: %s, sr: %d", audio.shape, sr)
 
-    logger.info("Loading vocals audio: %s", vocals_path)
-    vocals_audio, vocals_sr = torchaudio.load(str(vocals_path))
+    logger.info("Loading vocals audio for profiles: %s", vocals_profile_path)
+    vocals_audio, vocals_sr = torchaudio.load(str(vocals_profile_path))
     if vocals_audio.shape[0] > 1:
         vocals_audio = vocals_audio.mean(dim=0, keepdim=True)
     vocals_np = vocals_audio.squeeze(0)
@@ -462,7 +458,7 @@ def run_diarization(job_id: str, config_path: str) -> None:
         logger.info("TitaNet loaded on %s", device_str)
 
         # -------------------------------------------------------------------
-        # Extract embeddings
+        # Extract embeddings from vocals WAV
         # -------------------------------------------------------------------
         embeddings, valid_indices = extract_embeddings(
             dialogues=dialogues,
@@ -501,7 +497,6 @@ def run_diarization(job_id: str, config_path: str) -> None:
         all_assigned = set(valid_indices)
         for idx, dlg in enumerate(dialogues):
             if idx not in all_assigned:
-                # Find nearest valid dialogue by time
                 if valid_indices:
                     dlg_mid = (dlg["start_ms"] + dlg["end_ms"]) / 2
                     nearest = min(
@@ -532,14 +527,14 @@ def run_diarization(job_id: str, config_path: str) -> None:
         logger.info("Unique speakers: %d → %s", len(unique_speakers), unique_speakers)
 
         # -------------------------------------------------------------------
-        # Extract speaker profiles from vocals
+        # Speaker profile extraction — DISABLED (built by UI "Confirm Speakers")
         # -------------------------------------------------------------------
         speaker_segments: Dict[str, List[dict]] = {}
         for dlg in dialogues:
             spk = dlg["speaker_id"]
             speaker_segments.setdefault(spk, []).append({
                 "start_ms": dlg["start_ms"],
-                "end_ms": dlg["end_ms"],
+                "end_ms":   dlg["end_ms"],
             })
 
         """ saved_profiles = extract_speaker_profiles(
@@ -594,6 +589,8 @@ def run_diarization(job_id: str, config_path: str) -> None:
     unique_final = sorted(set(d["speaker_id"] for d in dialogues))
     logger.info("=" * 60)
     logger.info("STAGE 01b SUMMARY")
+    logger.info("  Model          : TitaNet (titanet_large)")
+    logger.info("  Audio source   : _vocals.wav (clean, no BGM)")
     logger.info("  Success        : %s", diarization_success)
     logger.info("  Total dialogues: %d", len(dialogues))
     logger.info("  Speakers found : %d → %s", len(unique_final), unique_final)

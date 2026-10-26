@@ -2,450 +2,241 @@
 """
 Stage 03: Translation
 =====================
-Translates each dialogue from the detected source language to English
-using Google Translate via the deep-translator library.
-
-If source language is already English, all dialogues are passed through
-as-is without any API calls.
-
-Input:  jobs/{job_id}/02_emotions.json
-        jobs/{job_id}/01_transcription.json  (for detected_language)
-Output: jobs/{job_id}/03_translations.json
-
-Behavior:
-- Reads detected_language from 01_transcription.json
-- English source → is_passthrough: true, no API call
-- Non-English source → Google Translate → is_passthrough: false
-- API failures → original text used, logged, pipeline never crashes
-- Stage is restart-safe: skips if manifest shows 03_translation=completed
-- No ML model, no VRAM used — pure Python + API
+Fixes vs previous:
+  - deep_translator GoogleTranslator with retry (3 attempts, exponential backoff)
+  - Strips HTML error responses (Google 500 errors returned as HTML text)
+  - Accepts --source_lang and --target_lang from server.py (via job_meta.json)
+  - Same-language passthrough when source == target
+  - Batch with delay to avoid rate limiting
 """
 
-import argparse
-import json
-import logging
-import os
-import sys
-import time
+import argparse, json, logging, os, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-STAGE_KEY: str = "03_translation"
-STAGE_NAME: str = "03_translation"
-
-# Delay between Google Translate API calls — avoids rate limiting
-API_CALL_DELAY_S: float = 0.1
-
-# Minimum text length to attempt translation — shorter texts passed through
-MIN_TRANSLATE_LENGTH: int = 2
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+STAGE_KEY  = "03_translation"
+STAGE_NAME = "03_translation"
+API_DELAY  = 0.3   # seconds between calls
+MAX_RETRY  = 3     # retries per dialogue
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 03: Translation")
-    parser.add_argument("--job_id", required=True, help="Unique job identifier")
-    parser.add_argument("--config", required=True, help="Path to config.yaml")
-    return parser.parse_args()
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--job_id",      required=True)
+    p.add_argument("--config",      required=True)
+    p.add_argument("--source_lang", required=False, default=None)
+    p.add_argument("--target_lang", required=False, default=None)
+    return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
+def load_config(path):
+    with open(path, encoding="utf-8") as f: return yaml.safe_load(f)
 
 
-def load_config(config_path: str) -> dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-
-
-def setup_logging(job_id: str, logs_dir: str) -> logging.Logger:
-    """
-    Creates a logger writing to both stdout and a dedicated log file.
-    Log file: logs/{job_id}_03_translation.log
-    """
+def setup_logging(job_id, logs_dir):
     os.makedirs(logs_dir, exist_ok=True)
     log_path = os.path.join(logs_dir, f"{job_id}_{STAGE_NAME}.log")
-
-    logger = logging.getLogger(STAGE_NAME)
+    logger   = logging.getLogger(STAGE_NAME)
     logger.setLevel(logging.DEBUG)
-
-    fmt = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
-
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    logger.info(f"Logging initialized → {log_path}")
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%Y-%m-%dT%H:%M:%S")
+    fh  = logging.FileHandler(log_path, encoding="utf-8"); fh.setLevel(logging.DEBUG); fh.setFormatter(fmt)
+    ch  = logging.StreamHandler(sys.stdout);               ch.setLevel(logging.INFO);  ch.setFormatter(fmt)
+    logger.addHandler(fh); logger.addHandler(ch)
     return logger
 
 
-# ---------------------------------------------------------------------------
-# Manifest helpers
-# ---------------------------------------------------------------------------
-
-
-def load_manifest(job_id: str, jobs_dir: str) -> dict[str, Any]:
-    path = os.path.join(jobs_dir, job_id, "manifest.json")
-    with open(path, "r", encoding="utf-8") as f:
+def load_manifest(job_id, jobs_dir):
+    with open(os.path.join(jobs_dir, job_id, "manifest.json"), encoding="utf-8") as f:
         return json.load(f)
 
-
-def save_manifest(
-    manifest: dict[str, Any], job_id: str, jobs_dir: str
-) -> None:
-    path = os.path.join(jobs_dir, job_id, "manifest.json")
-    with open(path, "w", encoding="utf-8") as f:
+def save_manifest(manifest, job_id, jobs_dir):
+    with open(os.path.join(jobs_dir, job_id, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-
-def mark_stage_complete(
-    job_id: str,
-    manifest: dict[str, Any],
-    jobs_dir: str,
-    logger: logging.Logger,
-) -> None:
-    manifest["stages"][STAGE_KEY]["status"] = "completed"
+def mark_complete(job_id, manifest, jobs_dir, logger):
+    manifest["stages"][STAGE_KEY]["status"]       = "completed"
     manifest["stages"][STAGE_KEY]["completed_at"] = datetime.now(timezone.utc).isoformat()
-    manifest["stages"][STAGE_KEY]["failed_at"] = None
+    manifest["stages"][STAGE_KEY]["failed_at"]    = None
     save_manifest(manifest, job_id, jobs_dir)
-    logger.info(f"Manifest updated: {STAGE_KEY} → completed")
+    logger.info(f"Manifest → {STAGE_KEY}: completed")
 
-
-def mark_stage_failed(
-    job_id: str,
-    manifest: dict[str, Any],
-    jobs_dir: str,
-    logger: logging.Logger,
-) -> None:
-    manifest["stages"][STAGE_KEY]["status"] = "failed"
+def mark_failed(job_id, manifest, jobs_dir, logger):
+    manifest["stages"][STAGE_KEY]["status"]    = "failed"
     manifest["stages"][STAGE_KEY]["failed_at"] = datetime.now(timezone.utc).isoformat()
     save_manifest(manifest, job_id, jobs_dir)
-    logger.error(f"Manifest updated: {STAGE_KEY} → failed")
+    logger.error(f"Manifest → {STAGE_KEY}: failed")
 
 
-# ---------------------------------------------------------------------------
-# Input loading
-# ---------------------------------------------------------------------------
+def is_html_error(text: str) -> bool:
+    """Detect when Google returns an HTML error page instead of translation."""
+    t = text.strip().lower()
+    return (t.startswith("<!doctype") or t.startswith("<html") or
+            "error 500" in t or "that's an error" in t or
+            "please try again" in t or len(text) > 2000)
 
 
-def load_emotions_json(job_id: str, jobs_dir: str) -> dict[str, Any]:
-    path = os.path.join(jobs_dir, job_id, "02_emotions.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_transcription_json(job_id: str, jobs_dir: str) -> dict[str, Any]:
-    path = os.path.join(jobs_dir, job_id, "01_transcription.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-# ---------------------------------------------------------------------------
-# Translator setup
-# ---------------------------------------------------------------------------
-
-
-def build_translator(source_lang: str, logger: logging.Logger) -> Any:
+def translate_with_retry(text: str, translator, logger, dialogue_id: str, max_retry: int = MAX_RETRY):
     """
-    Builds a GoogleTranslator instance for the given source language.
-
-    Falls back to source="auto" if the language code is not recognized
-    by deep-translator. Always targets English.
-
-    Args:
-        source_lang: ISO 639-1 language code (e.g. "en", "te", "hi")
-        logger: Logger instance
-
-    Returns:
-        GoogleTranslator instance
-    """
-    from deep_translator import GoogleTranslator
-
-    try:
-        translator = GoogleTranslator(source=source_lang, target="en")
-        # Test that the language is valid by checking supported languages
-        supported = GoogleTranslator.get_supported_languages(as_dict=True)
-        # deep-translator uses full names as keys, codes as values
-        # Check if source_lang is in the values
-        if source_lang not in supported.values() and source_lang != "auto":
-            logger.warning(
-                f"Language code '{source_lang}' may not be supported by GoogleTranslator. "
-                f"Falling back to source='auto'."
-            )
-            translator = GoogleTranslator(source="auto", target="en")
-        return translator
-    except Exception as e:
-        logger.warning(
-            f"Failed to build translator for '{source_lang}': {e}. "
-            f"Falling back to source='auto'."
-        )
-        return GoogleTranslator(source="auto", target="en")
-
-
-# ---------------------------------------------------------------------------
-# Translation core
-# ---------------------------------------------------------------------------
-
-
-def translate_text(
-    text: str,
-    translator: Any,
-    logger: logging.Logger,
-    dialogue_id: str,
-) -> tuple[str, bool]:
-    """
-    Translates a single text string to English using Google Translate.
-
+    Translate with exponential backoff retry.
     Returns (translated_text, is_passthrough).
-    On any failure, returns (original_text, True) — pipeline never crashes.
-
-    Args:
-        text: Source text to translate
-        translator: GoogleTranslator instance
-        logger: Logger instance
-        dialogue_id: For logging context
-
-    Returns:
-        (translation, is_passthrough) tuple
     """
-    # Too short to translate meaningfully
-    if len(text.strip()) < MIN_TRANSLATE_LENGTH:
-        logger.debug(f"{dialogue_id}: text too short, passing through: '{text}'")
+    if not text.strip() or len(text.strip()) < 2:
         return text, True
+
+    for attempt in range(1, max_retry + 1):
+        try:
+            result = translator.translate(text)
+
+            # Check for HTML error response
+            if not result or not result.strip():
+                logger.warning(f"[{dialogue_id}] Empty result (attempt {attempt})")
+                time.sleep(attempt * 1.5)
+                continue
+
+            if is_html_error(result):
+                logger.warning(f"[{dialogue_id}] HTML error response from Google (attempt {attempt}) — retrying")
+                time.sleep(attempt * 2.0)
+                continue
+
+            return result.strip(), False
+
+        except Exception as e:
+            err_str = str(e)
+            logger.warning(f"[{dialogue_id}] Translation error attempt {attempt}: {err_str[:80]}")
+            if attempt < max_retry:
+                time.sleep(attempt * 2.0)
+
+    logger.error(f"[{dialogue_id}] All {max_retry} attempts failed — using original text")
+    return text, True
+
+
+def build_translator(source_lang: str, target_lang: str, logger):
+    from deep_translator import GoogleTranslator
+    # Normalise language codes
+    src = source_lang if source_lang and source_lang not in ("auto","") else "auto"
+    tgt = target_lang if target_lang and target_lang not in ("","auto") else "en"
 
     try:
-        result = translator.translate(text)
-
-        if not result or not result.strip():
-            logger.warning(
-                f"{dialogue_id}: translation returned empty — using original text"
-            )
-            return text, True
-
-        return result.strip(), False
-
+        translator = GoogleTranslator(source=src, target=tgt)
+        logger.info(f"GoogleTranslator: {src} → {tgt}")
+        return translator, src, tgt
     except Exception as e:
-        logger.error(
-            f"{dialogue_id}: translation failed ({e}) — using original text"
-        )
-        return text, True
+        logger.warning(f"Translator init failed ({e}) — falling back to auto→{tgt}")
+        return GoogleTranslator(source="auto", target=tgt), "auto", tgt
 
 
-# ---------------------------------------------------------------------------
-# Output record builder
-# ---------------------------------------------------------------------------
-
-
-def build_output_record(
-    dialogue: dict[str, Any],
-    translation: str,
-    is_passthrough: bool,
-) -> dict[str, Any]:
-    """
-    Constructs a single dialogue entry for 03_translations.json.
-
-    Reads emotion as a plain string and intensity as a plain float —
-    as per the new schema from Stage 02. Does NOT access emotion as a dict.
-
-    Args:
-        dialogue: Raw dialogue dict from 02_emotions.json
-        translation: Translated (or passthrough) text
-        is_passthrough: True if no translation was performed
-
-    Returns:
-        Output dialogue record matching 03_translations.json schema
-    """
-    return {
-        "id": dialogue["id"],
-        "speaker_id": dialogue.get("speaker_id", "speaker_00"),
-        "start_ms": dialogue["start_ms"],
-        "end_ms": dialogue["end_ms"],
-        "text": dialogue["text"],
-        # emotion is a plain string in new schema — NOT a dict
-        "emotion": dialogue.get("emotion", "neutral"),
-        # intensity is a plain float at top level — NOT inside emotion dict
-        "intensity": dialogue.get("intensity", 0.0),
-        "translation": translation,
-        "is_passthrough": is_passthrough,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    args = parse_args()
+def main():
+    args   = parse_args()
     config = load_config(args.config)
-
-    jobs_dir: str = config["paths"]["jobs"]
-    logs_dir: str = config["paths"]["logs"]
-
-    logger = setup_logging(args.job_id, logs_dir)
+    logger = setup_logging(args.job_id, config["paths"]["logs"])
 
     logger.info("=" * 60)
-    logger.info(f"Stage 03 — Translation | job_id: {args.job_id}")
+    logger.info(f"Stage 03 Translation | job_id: {args.job_id}")
     logger.info("=" * 60)
 
-    # -----------------------------------------------------------------------
-    # Restart-safe check
-    # -----------------------------------------------------------------------
+    jobs_dir = config["paths"]["jobs"]
     manifest = load_manifest(args.job_id, jobs_dir)
 
     if manifest["stages"][STAGE_KEY]["status"] == "completed":
-        logger.info("Stage already completed. Skipping (restart-safe).")
+        logger.info("Already completed. Skipping.")
         return
 
-    # -----------------------------------------------------------------------
-    # Verify prerequisite
-    # -----------------------------------------------------------------------
-    if manifest["stages"]["02_emotion"]["status"] != "completed":
-        raise RuntimeError(
-            "Stage 02_emotion has not completed. Run Stage 02 first."
-        )
+    # Load transcription directly
+    trans_path = os.path.join(jobs_dir, args.job_id, "01_transcription.json")
+    with open(trans_path, encoding="utf-8") as f:
+        transcription = json.load(f)
 
-    # -----------------------------------------------------------------------
-    # Load inputs
-    # -----------------------------------------------------------------------
-    logger.info("Loading 02_emotions.json...")
-    emotions_data = load_emotions_json(args.job_id, jobs_dir)
-    dialogues: list[dict[str, Any]] = emotions_data["dialogues"]
-    total_dialogues = len(dialogues)
-    logger.info(f"Loaded {total_dialogues} dialogues")
+    dialogues         = transcription.get("dialogues", [])
+    detected_language = transcription.get("detected_language", "")
+    total             = len(dialogues)
+    logger.info(f"Loaded {total} dialogues | detected: {detected_language}")
 
-    logger.info("Loading 01_transcription.json for detected_language...")
-    transcription_data = load_transcription_json(args.job_id, jobs_dir)
-    detected_language: str = transcription_data.get("detected_language", "en")
-    logger.info(f"Detected source language: '{detected_language}'")
+    # ── Language resolution ──────────────────────────────────────────────
+    # Priority: CLI arg (from job_meta via server) → ASR detected → config → auto
+    if args.source_lang and args.source_lang not in ("auto",""):
+        source_lang = args.source_lang
+        logger.info(f"Source language from UI: {source_lang}")
+    elif detected_language and detected_language not in ("auto","unknown",""):
+        source_lang = detected_language
+        logger.info(f"Source language from ASR: {source_lang}")
+    else:
+        cfg_lang    = config.get("language",{}).get("source","auto")
+        source_lang = cfg_lang if cfg_lang not in ("auto","") else "auto"
+        logger.info(f"Source language from config: {source_lang}")
 
-    # -----------------------------------------------------------------------
-    # Determine if translation is needed
-    # -----------------------------------------------------------------------
-    source_is_english = detected_language.lower() in ("en", "english")
+    if args.target_lang and args.target_lang not in ("","auto"):
+        target_lang = args.target_lang
+        logger.info(f"Target language from UI: {target_lang}")
+    else:
+        target_lang = config.get("language",{}).get("target","en") or "en"
+        logger.info(f"Target language from config: {target_lang}")
 
-    if source_is_english:
-        logger.info(
-            "Source language is English — all dialogues will be passed through. "
-            "No API calls will be made."
-        )
+    # ── Same-language passthrough ────────────────────────────────────────
+    src_norm = source_lang.lower().strip()
+    tgt_norm = target_lang.lower().strip()
+    passthrough_all = (
+        src_norm == tgt_norm or
+        (src_norm in ("en","english") and tgt_norm in ("en","english")) or
+        src_norm == "auto"  # can't translate if we don't know source
+    )
+
+    if passthrough_all:
+        logger.info(f"Passthrough mode ({source_lang} → {target_lang}) — no translation needed")
         translator = None
     else:
-        logger.info(
-            f"Source language is '{detected_language}' — "
-            f"translating all dialogues to English via Google Translate."
-        )
-        translator = build_translator(detected_language, logger)
+        translator, source_lang, target_lang = build_translator(source_lang, target_lang, logger)
 
-    # -----------------------------------------------------------------------
-    # Process each dialogue
-    # -----------------------------------------------------------------------
-    output_dialogues: list[dict[str, Any]] = []
-    passthrough_count = 0
-    translated_count = 0
-    error_count = 0
+    # ── Process ──────────────────────────────────────────────────────────
+    output_dialogues = []
+    pass_count = trans_count = err_count = 0
 
-    for idx, dialogue in enumerate(dialogues):
-        did = dialogue["id"]
-        text = dialogue.get("text", "")
+    for idx, dlg in enumerate(dialogues):
+        did  = dlg["id"]
+        text = dlg.get("text", "")
+        logger.info(f"[{idx+1}/{total}] {did} | {dlg.get('speaker_id','?')} | '{text[:50]}'")
 
-        logger.info(
-            f"[{idx + 1}/{total_dialogues}] {did} | "
-            f"speaker: {dialogue.get('speaker_id', 'unknown')} | "
-            f"emotion: {dialogue.get('emotion', 'unknown')} | "
-            f"'{text[:50]}'"
-        )
-
-        if source_is_english:
-            # Pass through — no translation needed
-            translation = text
+        if passthrough_all or translator is None:
+            translation    = text
             is_passthrough = True
-            passthrough_count += 1
-            logger.debug(f"{did}: passthrough (English source)")
-
+            pass_count    += 1
         else:
-            # Translate to English
-            translation, is_passthrough = translate_text(
-                text, translator, logger, did
-            )
+            translation, is_passthrough = translate_with_retry(text, translator, logger, did)
+            if is_passthrough: err_count  += 1
+            else:               trans_count += 1
+            if idx < total - 1: time.sleep(API_DELAY)
 
-            if is_passthrough:
-                # translate_text only sets is_passthrough=True on failure
-                error_count += 1
-                logger.warning(f"{did}: fell back to original text")
-            else:
-                translated_count += 1
-                logger.info(f"{did} → '{translation[:60]}'")
+        if translation != text:
+            logger.info(f"  → '{translation[:60]}'")
 
-            # Polite delay between API calls
-            if idx < total_dialogues - 1 and not source_is_english:
-                time.sleep(API_CALL_DELAY_S)
+        output_dialogues.append({
+            "id":             did,
+            "speaker_id":     dlg.get("speaker_id","speaker_00"),
+            "start_ms":       dlg["start_ms"],
+            "end_ms":         dlg["end_ms"],
+            "text":           text,
+            "translation":    translation,
+            "is_passthrough": is_passthrough,
+        })
 
-        output_dialogues.append(
-            build_output_record(dialogue, translation, is_passthrough)
-        )
-
-    # -----------------------------------------------------------------------
-    # Write 03_translations.json
-    # -----------------------------------------------------------------------
-    output_dir = os.path.join(jobs_dir, args.job_id)
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "03_translations.json")
-
-    output_data: dict[str, Any] = {
-        "job_id": args.job_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_lang": detected_language,
-        "target_lang": "en",
+    # ── Write output ─────────────────────────────────────────────────────
+    output_path = os.path.join(jobs_dir, args.job_id, "03_translations.json")
+    output = {
+        "job_id":         args.job_id,
+        "created_at":     datetime.now(timezone.utc).isoformat(),
+        "source_lang":    source_lang,
+        "target_lang":    target_lang,
         "dialogue_count": len(output_dialogues),
-        "dialogues": output_dialogues,
+        "dialogues":      output_dialogues,
     }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
 
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"03_translations.json written → {output_path}")
-        logger.info(
-            f"Summary: {passthrough_count} passthrough, "
-            f"{translated_count} translated, "
-            f"{error_count} errors (fell back to original)"
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to write output JSON: {e}")
-        mark_stage_failed(args.job_id, manifest, jobs_dir, logger)
-        raise
-
-    # -----------------------------------------------------------------------
-    # Mark complete
-    # -----------------------------------------------------------------------
-    mark_stage_complete(args.job_id, manifest, jobs_dir, logger)
+    logger.info(f"Written: {output_path}")
+    logger.info(f"Summary: {pass_count} passthrough | {trans_count} translated | {err_count} errors")
+    mark_complete(args.job_id, manifest, jobs_dir, logger)
     logger.info("Stage 03 complete ✓")
 
 
@@ -453,6 +244,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Top-level catch — ensures non-zero exit code on failure
         print(f"FATAL: {e}", file=sys.stderr)
         sys.exit(1)
