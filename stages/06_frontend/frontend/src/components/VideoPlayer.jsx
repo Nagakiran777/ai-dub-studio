@@ -1,4 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react'
+import axios from 'axios'
+import { setElementGain, scheduleMute, silenceWindows } from '../dubPlayback'
 import { useStore } from '../store'
 import { useAudio } from '../useAudio'
 
@@ -29,12 +31,17 @@ const fmt = (s) => {
 }
 
 export default function VideoPlayer() {
-  const { currentJobId, setPlayheadMs, playheadMs, transcription, ttsManifest, manifest, setVideoPlaying, dubbedView, setDubbedView } = useStore()
+  const { currentJobId, setPlayheadMs, playheadMs, transcription, ttsManifest, manifest, setVideoPlaying, dubbedView, setDubbedView, assembled, mix, setMixLayer } = useStore()
   const containerRef = useRef(null)
   const videoRef   = useRef(null)
   const barRef     = useRef(null)
   const bgAudioRef  = useAudio()
   const ttsAudioRef = useAudio()
+  const vocAudioRef = useAudio()           // the VOCALS layer (original vocals, silenced under the dubbed dialogues)
+  const mixRef      = useRef(mix)
+  mixRef.current    = mix
+  const lastMuteSchedRef = useRef(0)
+  const [mixerOpen, setMixerOpen] = useState(false)
   const [playing,  setPlaying]  = useState(false)
   const [duration, setDuration] = useState(0)
   const [speed,    setSpeed]    = useState(1)
@@ -43,6 +50,7 @@ export default function VideoPlayer() {
   const [scrubbing, setScrubbing] = useState(false)
   const [hoverFrac, setHoverFrac] = useState(null)
   const activeTtsIdRef  = useRef(null)
+  const activePartRef   = useRef(null)    // {dlg, trimOut, speed} of the piece now playing
   const activeDubSpeedRef = useRef(1)   // per-dialogue dub speed of the clip now playing
   const speedRef = useRef(1)            // latest global speed, for listeners
   speedRef.current = speed
@@ -50,6 +58,62 @@ export default function VideoPlayer() {
   const wasPlayingRef = useRef(false)
 
   const videoUrl = currentJobId ? `${API}/jobs/${currentJobId}/video` : null
+
+  // After an export the player shows the REAL assembled video (its audio already is the dub).
+  // As soon as anything is edited the export is out of date and the live preview takes over.
+  const [viewPreview, setViewPreview] = useState(false)           // user chose to look at the preview anyway
+  useEffect(() => { setViewPreview(false) }, [currentJobId, assembled?.version, assembled?.stale])
+  const assembledFresh = !!(assembled?.available && !assembled?.stale)
+  const showAssembled  = assembledFresh && !viewPreview
+  const mixOn = dubbedView && !showAssembled          // the in-browser dub mix only runs for the preview
+  const assembledUrl = currentJobId ? `${API}/jobs/${currentJobId}/assembled_video?v=${assembled?.version || 0}` : null
+
+  // Some formats (webm, mkv, avi, HEVC …) can't play in a browser as-is; the server
+  // converts them once into a preview copy. Ask until it's ready.
+  const [pv, setPv] = useState({ state: 'checking', error: '' })
+  useEffect(() => {
+    if (!currentJobId) return
+    let dead = false, timer = null
+    setPv({ state: 'checking', error: '' })
+    const poll = async () => {
+      try {
+        const { data } = await axios.get(`${API}/jobs/${currentJobId}/video_status`)
+        if (dead) return
+        setPv({ state: data.state, error: data.error || '' })
+        if (data.state === 'processing') timer = setTimeout(poll, 2000)
+      } catch { if (!dead) setPv({ state: 'failed', error: 'Could not reach the server' }) }
+    }
+    poll()
+    return () => { dead = true; clearTimeout(timer) }
+  }, [currentJobId])
+  const lastPlayRef = useRef({ t: 0, playing: false })
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const tu = () => { lastPlayRef.current.t = v.currentTime }
+    const pl = () => { lastPlayRef.current.playing = true }
+    const pa = () => { lastPlayRef.current.playing = false }
+    v.addEventListener('timeupdate', tu); v.addEventListener('play', pl); v.addEventListener('pause', pa)
+    return () => { v.removeEventListener('timeupdate', tu); v.removeEventListener('play', pl); v.removeEventListener('pause', pa) }
+  }, [currentJobId])
+  useEffect(() => {          // after the picture source changes, continue from the same moment
+    const v = videoRef.current
+    if (!v) return
+    const { t, playing } = lastPlayRef.current
+    if (t < 0.1) return
+    const go = () => { try { v.currentTime = t } catch {} ; if (playing) v.play().catch(() => {}) }
+    v.addEventListener('loadedmetadata', go, { once: true })
+    return () => v.removeEventListener('loadedmetadata', go)
+  }, [showAssembled, assembled?.version])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const retryPreview = async () => {
+    setPv({ state: 'processing', error: '' })
+    await axios.post(`${API}/jobs/${currentJobId}/video_status/retry`).catch(() => {})
+    setPv({ state: 'checking', error: '' })
+    // re-run the poll by toggling the job effect
+    const { data } = await axios.get(`${API}/jobs/${currentJobId}/video_status`).catch(() => ({ data: { state: 'failed' } }))
+    setPv({ state: data.state, error: data.error || '' })
+  }
   const ttsDone  = manifest?.stages?.['04_tts']?.status === 'completed'
   const ttsMap = {}
   ;(ttsManifest?.dialogues || []).forEach(d => { ttsMap[d.id] = d })
@@ -67,6 +131,19 @@ export default function VideoPlayer() {
     v.addEventListener('timeupdate', onTime); v.addEventListener('loadedmetadata', onMeta)
     return () => { v.removeEventListener('timeupdate', onTime); v.removeEventListener('loadedmetadata', onMeta) }
   }, [currentJobId])
+
+  // Mixer sliders / per-dialogue volume changed → apply to what is playing right now
+  useEffect(() => {
+    if (!mixOn) return
+    setElementGain(bgAudioRef.current, mix.no_vocals)
+    setElementGain(vocAudioRef.current, mix.vocals)
+    const key = activeTtsIdRef.current
+    if (key) {
+      const id = key.split(':')[0]
+      setElementGain(ttsAudioRef.current, (ttsMap[id]?.dub_volume ?? 1) * mix.dub)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mix, mixOn, ttsManifest])
 
   // Sync playhead from timeline click
   useEffect(() => {
@@ -95,7 +172,9 @@ export default function VideoPlayer() {
   useEffect(() => {
     setRate(videoRef.current, speed, true)
     setRate(bgAudioRef.current, speed, true)
+    setRate(vocAudioRef.current, speed, true)
     setRate(ttsAudioRef.current, speed * activeDubSpeedRef.current, true)
+    if (mixOn && vocAudioRef.current.getAttribute('src')) scheduleMute(vocAudioRef.current, silenceWindows(dialogues, ttsMap), speed)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [speed])
 
@@ -107,53 +186,67 @@ export default function VideoPlayer() {
     const v = videoRef.current
     const bg = bgAudioRef.current
     const tts = ttsAudioRef.current
+    const voc = vocAudioRef.current
     if (!v || !bg || !tts) return
-    if (dubbedView) {
+    if (mixOn) {
       v.muted = true
       bg.src = `${API}/jobs/${currentJobId}/audio_track/no_vocals`
       setRate(bg, speedRef.current, true)
       bg.currentTime = v.currentTime
       bg.volume = vol
       tts.volume = vol
+      // vocals layer: everything the original voices did except the replaced dialogues
+      voc.src = `${API}/jobs/${currentJobId}/audio_track/vocals`
+      setRate(voc, speedRef.current, true)
+      voc.currentTime = v.currentTime
+      voc.volume = vol
+      setElementGain(bg, mixRef.current.no_vocals)
+      setElementGain(voc, mixRef.current.vocals)
+      scheduleMute(voc, silenceWindows(dialogues, ttsMap), speedRef.current)
       activeTtsIdRef.current = null
-      if (playing) bg.play().catch(() => {})
+      if (playing) { bg.play().catch(() => {}); voc.play().catch(() => {}) }
     } else {
       // Fully tear down rather than just pause — clearing .src (and calling
       // .load()) drops any buffered playback state, so nothing from a previous
       // dubbed session can stay audible once you switch back to the original.
       bg.pause(); bg.removeAttribute('src'); bg.load()
+      voc.pause(); voc.removeAttribute('src'); voc.load()
       tts.pause(); tts.removeAttribute('src'); tts.load()
       activeTtsIdRef.current = null
       v.muted = false
       v.volume = vol
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dubbedView, currentJobId])
+  }, [mixOn, currentJobId])
 
   useEffect(() => {
     const v = videoRef.current
-    if (!v || !dubbedView) return
-    const bg = bgAudioRef.current, tts = ttsAudioRef.current
+    if (!v || !mixOn) return
+    const bg = bgAudioRef.current, tts = ttsAudioRef.current, voc = vocAudioRef.current
+    const resched = () => scheduleMute(voc, silenceWindows(dialogues, ttsMap), speedRef.current)
     const onPlay = () => {
       bg.play().catch(() => {})
+      voc.play().catch(() => {}); resched()
       // pick the dub up where it was paused (pause -> play inside a line used to leave it silent)
       if (activeTtsIdRef.current && tts.getAttribute('src') && !tts.ended) tts.play().catch(() => {})
     }
-    const onPause = () => { bg.pause(); tts.pause() }
+    const onPause = () => { bg.pause(); voc.pause(); tts.pause() }
+    const onSeeked = () => resched()
     const onSeeking = () => {
       bg.currentTime = v.currentTime
+      voc.currentTime = v.currentTime
       // A seek can land inside the clip that's "already active" — drop it so
       // the next tick restarts it at the right offset instead of mid-sentence.
       tts.pause(); activeTtsIdRef.current = null
     }
-    v.addEventListener('play', onPlay); v.addEventListener('pause', onPause); v.addEventListener('seeking', onSeeking)
-    return () => { v.removeEventListener('play', onPlay); v.removeEventListener('pause', onPause); v.removeEventListener('seeking', onSeeking) }
-  }, [dubbedView])
+    v.addEventListener('play', onPlay); v.addEventListener('pause', onPause); v.addEventListener('seeking', onSeeking); v.addEventListener('seeked', onSeeked)
+    return () => { v.removeEventListener('play', onPlay); v.removeEventListener('pause', onPause); v.removeEventListener('seeking', onSeeking); v.removeEventListener('seeked', onSeeked) }
+  }, [mixOn, dialogues, ttsManifest])
 
   useEffect(() => {
     const v = videoRef.current
-    if (!v || !dubbedView) return
-    const bg = bgAudioRef.current, tts = ttsAudioRef.current
+    if (!v || !mixOn) return
+    const bg = bgAudioRef.current, tts = ttsAudioRef.current, voc = vocAudioRef.current
     const onTime = () => {
       // The mix only follows the video while it is actually PLAYING. A paused
       // video still fires 'timeupdate' after every seek (e.g. clicking a
@@ -161,27 +254,55 @@ export default function VideoPlayer() {
       // dub on top of the timeline's own click-preview — the "echo".
       if (v.paused) return
       if (Math.abs(bg.currentTime - v.currentTime) > 0.3) bg.currentTime = v.currentTime
+      if (voc.getAttribute('src')) {
+        if (Math.abs(voc.currentTime - v.currentTime) > 0.3) { voc.currentTime = v.currentTime; scheduleMute(voc, silenceWindows(dialogues, ttsMap), speedRef.current) }
+        else if (Date.now() - lastMuteSchedRef.current > 4000) {           // re-anchor the scheduled mutes to absorb clock drift
+          lastMuteSchedRef.current = Date.now()
+          scheduleMute(voc, silenceWindows(dialogues, ttsMap), speedRef.current)
+        }
+      }
       const ms = v.currentTime * 1000
       // The clip that should be playing is whichever dialogue's start we most
       // recently passed — NOT gated on the original line's end, so a dub that
       // runs longer than the original line plays out in full, like the export.
-      let target = null
+      // Each dub has its OWN position/length (moved, trimmed, sped up in the
+      // Dubbed timeline view) — independent of the original line's bar. Deleted
+      // dubs are skipped, exactly like the export.
+      // A dub may be cut into several pieces; each piece has its own position, trim and speed.
+      let target = null, targetStart = 0, targetPart = null
       for (const d of dialogues) {
-        if (!ttsMap[d.id]?.success) continue
-        if (ms >= d.start_ms && ms < d.start_ms + MAX_DUB_MS && (!target || d.start_ms > target.start_ms)) target = d
+        const e = ttsMap[d.id]
+        if (!e?.success) continue
+        for (const p of (e.parts || [])) {
+          if (p.deleted) continue
+          if (ms >= p.dub_start_ms && ms < p.dub_end_ms && (!target || p.dub_start_ms > targetStart)) {
+            target = d; targetStart = p.dub_start_ms; targetPart = p
+          }
+        }
       }
-      const targetId = target?.id || null
-      if (targetId !== activeTtsIdRef.current) {
-        activeTtsIdRef.current = targetId
-        if (targetId) {
-          const dubSpeed = ttsMap[targetId]?.speed ?? 1
+      const targetKey = target ? `${target.id}:${targetPart.part_id}` : null
+      if (targetKey !== activeTtsIdRef.current) {
+        // Two pieces of the same clip that touch (a fresh split) play straight through — no reload, no gap.
+        const prevPiece = activePartRef.current
+        if (targetKey && prevPiece && prevPiece.dlg === target.id && Math.abs(prevPiece.trimOut - (targetPart.trim_in_ms || 0)) < 2
+            && prevPiece.speed === targetPart.speed && !tts.paused && !tts.ended) {
+          activeTtsIdRef.current = targetKey
+          activePartRef.current = { dlg: target.id, trimOut: targetPart.trim_out_ms, speed: targetPart.speed }
+          return
+        }
+        activeTtsIdRef.current = targetKey
+        activePartRef.current = targetKey ? { dlg: target.id, trimOut: targetPart.trim_out_ms, speed: targetPart.speed } : null
+        if (targetKey) {
+          const dubSpeed = targetPart.speed ?? 1
           activeDubSpeedRef.current = dubSpeed
-          tts.src = `${API}/jobs/${currentJobId}/tts_audio/${targetId}?t=${Date.now()}`
+          tts.src = `${API}/jobs/${currentJobId}/tts_audio/${target.id}?t=${Date.now()}`
           setRate(tts, speedRef.current * dubSpeed, true)   // after src: it resets the rate
           tts.volume = vol
-          // In the export the clip starts at the dialogue's start, so if we
-          // arrive part-way into the line (a seek) start part-way into the clip.
-          const offset = Math.max(0, (ms - target.start_ms) / 1000 * dubSpeed)
+          // level = this dialogue's own volume × the Dubbed layer slider — exactly what the export uses (no auto-normalization)
+          setElementGain(tts, (ttsMap[target.id]?.dub_volume ?? 1) * mixRef.current.dub)
+          // Arriving part-way into a piece (a seek) starts part-way into the clip; the
+          // piece's kept stretch begins at its trim-in point.
+          const offset = (targetPart.trim_in_ms || 0) / 1000 + Math.max(0, (ms - targetStart) / 1000 * dubSpeed)
           tts.currentTime = offset > 0.05 ? offset : 0
           tts.play().catch(() => {})
         } else {
@@ -193,7 +314,7 @@ export default function VideoPlayer() {
     v.addEventListener('timeupdate', onTime)
     return () => v.removeEventListener('timeupdate', onTime)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dubbedView, dialogues, ttsManifest, currentJobId, vol])
+  }, [mixOn, dialogues, ttsManifest, currentJobId, vol])
 
   const togglePlay = () => {
     if (!videoRef.current) return
@@ -203,9 +324,10 @@ export default function VideoPlayer() {
 
   const changeVol = v => {
     setVol(v)
-    if (videoRef.current && !dubbedView) videoRef.current.volume = v
+    if (videoRef.current && !mixOn) videoRef.current.volume = v
     if (bgAudioRef.current) bgAudioRef.current.volume = v
     if (ttsAudioRef.current) ttsAudioRef.current.volume = v
+    if (vocAudioRef.current) vocAudioRef.current.volume = v
   }
 
   // ── Seek bar: click, or press-hold-and-drag. The video is paused while
@@ -259,7 +381,7 @@ export default function VideoPlayer() {
     <div ref={containerRef} style={{ height:'100%', display:'flex', flexDirection:'column', background:'#000' }}>
       <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', overflow:'hidden', position:'relative' }}>
         {videoUrl
-          ? <video ref={videoRef} src={videoUrl} style={{ maxHeight:'100%', maxWidth:'100%', objectFit:'contain' }}
+          ? <video ref={videoRef} src={showAssembled ? assembledUrl : (pv.state === 'ready' ? videoUrl : undefined)} style={{ maxHeight:'100%', maxWidth:'100%', objectFit:'contain' }}
               onPlay={() => { setPlaying(true); setVideoPlaying(true) }}
               onPause={() => { setPlaying(false); setVideoPlaying(false) }}
               onEnded={() => { setPlaying(false); setVideoPlaying(false) }} />
@@ -267,10 +389,45 @@ export default function VideoPlayer() {
               <span style={{ fontSize:32 }}>🎬</span><span>Select a job to preview</span>
             </div>
         }
+        {videoUrl && !showAssembled && (pv.state === 'processing' || pv.state === 'checking' || pv.state === 'failed') && (
+          <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:10, color:'#888', fontSize:12, textAlign:'center', padding:24, background:'rgba(0,0,0,0.6)', zIndex:5 }}>
+            {pv.state === 'failed' ? (
+              <>
+                <span style={{ fontSize:26 }}>⚠️</span>
+                <span style={{ color:'#f87171' }}>This video couldn't be prepared for preview</span>
+                <span style={{ fontSize:10, color:'#666', maxWidth:360 }}>{pv.error}</span>
+                <button onClick={retryPreview} style={{ padding:'5px 14px', borderRadius:7, fontSize:11, cursor:'pointer', background:'rgba(245,166,35,0.1)', border:'1px solid rgba(245,166,35,0.3)', color:'#f5a623' }}>Try again</button>
+              </>
+            ) : (
+              <>
+                <div className="spinner" style={{ width:22, height:22 }} />
+                <span>{pv.state === 'processing' ? 'Converting this video so your browser can play it…' : 'Checking video…'}</span>
+                {pv.state === 'processing' && <span style={{ fontSize:10, color:'#555' }}>Only for the preview — dubbing and export use your original file.</span>}
+              </>
+            )}
+          </div>
+        )}
+        {/* The preview is only an approximation — say so until the real video has been assembled */}
+        {videoUrl && ttsDone && !showAssembled && pv.state === 'ready' && (
+          <div style={{ position:'absolute', left:8, bottom:8, maxWidth:'62%', zIndex:6, padding:'5px 9px', borderRadius:8, fontSize:9.5, lineHeight:1.45, color:'#e9c46a', background:'rgba(0,0,0,0.62)', border:'1px solid rgba(245,166,35,0.3)', backdropFilter:'blur(4px)' }}>
+            {assembled?.available && assembled?.stale
+              ? <>You changed something after the last export, so this is the <b>preview</b> again. Export to assemble the video and see the real output.</>
+              : assembled?.available
+              ? <>Showing the <b>preview</b>. <button onClick={() => setViewPreview(false)} style={{ background:'none', border:'none', color:'#4ade80', cursor:'pointer', fontSize:9.5, padding:0, textDecoration:'underline' }}>Show the assembled output</button></>
+              : <>This is only a <b>preview</b> and does not show the real output — Export to assemble the video and see it.</>}
+          </div>
+        )}
         {videoUrl && (
-          <div style={{ position:'absolute', top:8, right:8, display:'flex', gap:6, alignItems:'center' }}>
+          <div style={{ position:'absolute', top:8, right:8, display:'flex', gap:6, alignItems:'center', zIndex:6 }}>
+            {showAssembled && (
+              <div style={{ display:'flex', alignItems:'center', gap:8, padding:'4px 10px', borderRadius:9, background:'rgba(34,197,94,0.16)', border:'1px solid rgba(34,197,94,0.45)', backdropFilter:'blur(4px)' }}>
+                <span style={{ fontSize:10, fontWeight:700, color:'#4ade80' }}>✓ ASSEMBLED OUTPUT</span>
+                <button onClick={() => setViewPreview(true)} title="Look at the live editing preview instead"
+                  style={{ fontSize:9, padding:'2px 7px', borderRadius:6, cursor:'pointer', background:'rgba(0,0,0,0.35)', border:'1px solid rgba(255,255,255,0.15)', color:'#bbb' }}>Show preview</button>
+              </div>
+            )}
             {/* Original | Dubbed — locked to Original until Voice Synthesis is done */}
-            <div role="group" aria-label="Audio" title={ttsDone ? 'Switch between the original audio and the dubbed mix (a live preview — export for the final file)' : 'Available after Voice Synthesis'}
+            {!showAssembled && <div role="group" aria-label="Audio" title={ttsDone ? 'Switch between the original audio and the dubbed mix (a live preview — export for the final file)' : 'Available after Voice Synthesis'}
               style={{
                 display:'flex', padding:2, borderRadius:9, gap:2,
                 background:'rgba(0,0,0,0.55)', border:'1px solid rgba(255,255,255,0.15)', backdropFilter:'blur(4px)',
@@ -292,7 +449,7 @@ export default function VideoPlayer() {
                   </button>
                 )
               })}
-            </div>
+            </div>}
             <button onClick={toggleFullscreen} title="Fullscreen"
               style={{
                 width:28, height:28, borderRadius:7, cursor:'pointer',
@@ -342,8 +499,32 @@ export default function VideoPlayer() {
           {playing?'⏸':'▶'}
         </button>
         <span style={{ fontSize:11, color:'#666', fontFamily:'monospace' }}>{fmt(playheadMs/1000)} / {fmt(duration)}</span>
-        {dubbedView && <span style={{ fontSize:9, color:'#f5a623', fontWeight:700 }}>● DUBBED</span>}
+        {showAssembled ? <span style={{ fontSize:9, color:'#4ade80', fontWeight:700 }}>● ASSEMBLED</span> : mixOn && <span style={{ fontSize:9, color:'#f5a623', fontWeight:700 }}>● DUBBED PREVIEW</span>}
         <div style={{ flex:1 }} />
+        {/* Mixer: how loud each LAYER is — saved with the job and used by the export too */}
+        <div style={{ position:'relative' }}>
+          <button onClick={() => setMixerOpen(o => !o)} title="Mixer — volume of the background, vocals and dubbed layers"
+            style={{ padding:'3px 8px', borderRadius:6, fontSize:10, cursor:'pointer', background: mixerOpen?'rgba(245,166,35,0.15)':'transparent',
+                     color: (mix.no_vocals!==1||mix.vocals!==1||mix.dub!==1) ? '#f5a623' : '#666', border:`1px solid ${mixerOpen?'rgba(245,166,35,0.35)':'#262626'}` }}>🎚 Mixer</button>
+          {mixerOpen && (
+            <div role="dialog" aria-label="Mixer" style={{ position:'absolute', bottom:'calc(100% + 8px)', right:0, width:250, padding:'10px 12px', borderRadius:10, background:'#121212', border:'1px solid #2a2a2a', boxShadow:'0 12px 40px rgba(0,0,0,0.6)', zIndex:50 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+                <span style={{ fontSize:10, fontWeight:700, color:'#f5a623', textTransform:'uppercase', letterSpacing:'0.07em' }}>Mixer</span>
+                <button onClick={() => { setMixLayer('no_vocals',1); setMixLayer('vocals',1); setMixLayer('dub',1) }} style={{ fontSize:9, padding:'1px 7px', borderRadius:5, cursor:'pointer', background:'transparent', border:'1px solid #262626', color:'#777' }}>↺ Reset all</button>
+              </div>
+              {[['no_vocals','Background (non-vocals)'],['vocals','Vocals (screams, sounds)'],['dub','Dubbed voices']].map(([k,label]) => (
+                <div key={k} style={{ marginBottom:9 }}>
+                  <div style={{ display:'flex', justifyContent:'space-between', fontSize:10, color:'#999', marginBottom:2 }}>
+                    <span>{label}</span><b style={{ color: mix[k]===1?'#888':'#f5a623', fontFamily:'monospace' }}>{Math.round(mix[k]*100)}%</b>
+                  </div>
+                  <input type="range" aria-label={label} min={0} max={3} step={0.05} value={mix[k]} onChange={e => setMixLayer(k, parseFloat(e.target.value))}
+                    onDoubleClick={() => setMixLayer(k, 1)} style={{ width:'100%', accentColor:'#f5a623', cursor:'pointer', margin:0 }} />
+                </div>
+              ))}
+              <div style={{ fontSize:9, color:'#444', lineHeight:1.5 }}>Double-click a slider for 100 %. The same levels are used when you export. Each dubbed line also has its own volume in the Dubbed view.</div>
+            </div>
+          )}
+        </div>
         <span style={{ fontSize:11, color:'#444' }}>{vol===0?'🔇':'🔊'}</span>
         <input type="range" min={0} max={1} step={0.05} value={vol} onChange={e => changeVol(parseFloat(e.target.value))}
           style={{ width:55, accentColor:'#f5a623', cursor:'pointer' }} />

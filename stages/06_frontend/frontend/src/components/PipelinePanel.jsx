@@ -127,6 +127,46 @@ function StatusBar({ manifest, onRunAll, onExport, onStop, onDownload, onOpenTra
   )
 }
 
+// GLOBAL speech-recognition model — used for ALL dialogues the next time this stage runs.
+// (Re-transcribing a single dialogue has its own model choice in the dialogue editor.)
+const ASR_CHOICES = [
+  { id: 'medium',   label: 'Medium',   note: 'recommended' },
+  { id: 'large-v3', label: 'Large-v3', note: 'if the transcription is poor' },
+]
+function AsrModelPicker({ disabled }) {
+  const { asrModel, setAsrModel, currentJobId } = useStore()
+  if (!currentJobId) return null
+  return (
+    <div style={{ margin: '2px 6px 6px 28px', padding: '6px 8px', borderRadius: 8, background: 'rgba(255,255,255,0.025)', border: '1px solid #1c1c1c' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
+        <span style={{ fontSize: 9, color: '#555', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Select ASR model · all dialogues</span>
+      </div>
+      <div role="radiogroup" aria-label="ASR model" style={{ display: 'flex', gap: 4 }}>
+        {ASR_CHOICES.map(c => {
+          const on = asrModel === c.id
+          return (
+            <button key={c.id} role="radio" aria-checked={on} disabled={disabled}
+              title={`${c.label} — ${c.note}. Used for every dialogue the next time Speech Recognition runs (▶ / ↻).`}
+              onClick={() => setAsrModel(c.id)}
+              style={{
+                flex: 1, padding: '4px 6px', borderRadius: 6, fontSize: 10, fontWeight: 600, cursor: disabled ? 'not-allowed' : 'pointer',
+                background: on ? 'rgba(245,166,35,0.16)' : 'transparent',
+                border: `1px solid ${on ? 'rgba(245,166,35,0.45)' : '#262626'}`,
+                color: on ? '#f5a623' : '#666', opacity: disabled ? 0.5 : 1, lineHeight: 1.25,
+              }}>
+              {c.label}
+              <div style={{ fontSize: 8, fontWeight: 500, color: on ? '#c98a1c' : '#444' }}>{c.note}</div>
+            </button>
+          )
+        })}
+      </div>
+      <div style={{ fontSize: 8.5, color: '#3d3d3d', marginTop: 4, lineHeight: 1.4 }}>
+        Applies the next time Speech Recognition runs — press ↻ on it to redo the transcription with this model.
+      </div>
+    </div>
+  )
+}
+
 export default function PipelinePanel() {
   const {
     manifest, currentJobId,
@@ -186,11 +226,14 @@ export default function PipelinePanel() {
           handled entirely from the Translation panel instead. */}
       <div style={{ padding: '5px 10px 10px', flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 2 }}>
         {STAGES.map(s => (
-          <StageRow key={s.id} stage={s} status={getStatus(s.id)}
-            isActive={pipelineStage === s.id && pipelineRunning}
-            canRunOnly={!!currentJobId && !pipelineRunning && s.id !== '03_translation'}
-            onRunOnly={() => runSingleStage(s.id)}
-          />
+          <React.Fragment key={s.id}>
+            <StageRow stage={s} status={getStatus(s.id)}
+              isActive={pipelineStage === s.id && pipelineRunning}
+              canRunOnly={!!currentJobId && !pipelineRunning && s.id !== '03_translation'}
+              onRunOnly={() => runSingleStage(s.id)}
+            />
+            {s.id === '01_asr' && <AsrModelPicker disabled={pipelineRunning && pipelineStage === '01_asr'} />}
+          </React.Fragment>
         ))}
       </div>
     </div>

@@ -41,6 +41,9 @@ import torch
 import torchaudio
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
+import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
+
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 # ---------------------------------------------------------------------------
@@ -310,6 +313,171 @@ def prepare_ref_audio(
 
 
 # ---------------------------------------------------------------------------
+# REF AUDIO — user-uploaded files + authoritative transcript lookup
+# ---------------------------------------------------------------------------
+
+USER_REF_PREFIX = "user:"          # manual_ref_audio = "user:<ref_id>"
+MAX_REF_SECONDS = 10.0             # prepare_ref_audio() trims to this
+
+SHORT_REF_FLOOR_S  = 0.15    # anything shorter than this is just a click/breath — not usable as a voice sample
+SHORT_REF_REPEATS  = 3       # a ref under the minimum length is repeated this many times (at least)
+
+
+def repeat_short_ref(audio: np.ndarray, sr: int, text: str | None, min_s: float,
+                     gap_ms: int = 60, base_repeats: int = SHORT_REF_REPEATS):
+    """Make a too-short reference long enough: the SAME clip repeated `base_repeats` times
+    (more only if even that is still under `min_s`), with a tiny gap between copies, and the
+    transcript repeated the same number of times so it still describes the audio exactly.
+    Returns (audio, text_or_None, repeats)."""
+    one = len(audio) / float(sr)
+    n = base_repeats
+    while n < 10 and (n * one + (n - 1) * gap_ms / 1000.0) < min_s:
+        n += 1
+    gap = np.zeros(int(sr * gap_ms / 1000.0), dtype=audio.dtype)
+    parts = []
+    for i in range(n):
+        parts.append(audio)
+        if i < n - 1:
+            parts.append(gap)
+    out = np.concatenate(parts)
+    txt = " ".join([text.strip()] * n) if text and text.strip() else None
+    return out, txt, n
+
+
+def load_original_text_lookup(jobs_dir: str, job_id: str) -> dict[str, str]:
+    """dialogue_id -> ORIGINAL text, read from 01_transcription.json.
+
+    The `text` copy inside 03_translations.json goes stale when the user edits
+    the original text in the editor (that edit only touches the transcription
+    file). Using the stale copy as ref_text gave OmniVoice a transcript that did
+    not match the reference audio, which hurts voice cloning.
+    """
+    p = Path(jobs_dir) / job_id / "01_transcription.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return {d["id"]: (d.get("text") or "") for d in data.get("dialogues", []) if "id" in d}
+
+
+def resolve_user_ref(job_dir: Path, manual_ref_id: str, logger: logging.Logger, dialogue_id: str):
+    """Load a reference the user uploaded (jobs/<job>/user_refs/<id>.wav).
+
+    Returns (audio_np, sr, ref_text_or_None) or (None, None, None) if missing.
+    """
+    ref_id = manual_ref_id[len(USER_REF_PREFIX):]
+    if not ref_id or not all(c.isalnum() or c in "_-" for c in ref_id):
+        logger.warning(f"[{dialogue_id}] Bad user ref id '{manual_ref_id}' — falling back")
+        return None, None, None
+    refs_dir = job_dir / "user_refs"
+    wav_path = refs_dir / f"{ref_id}.wav"
+    if not wav_path.exists():
+        logger.warning(f"[{dialogue_id}] User ref '{ref_id}' not found — falling back")
+        return None, None, None
+    try:
+        audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+    except Exception as e:
+        logger.warning(f"[{dialogue_id}] Could not read user ref '{ref_id}': {e} — falling back")
+        return None, None, None
+    ref_text = None
+    idx_path = refs_dir / "index.json"
+    if idx_path.exists():
+        try:
+            with open(idx_path, "r", encoding="utf-8") as f:
+                for r in json.load(f).get("refs", []):
+                    if r.get("id") == ref_id:
+                        ref_text = (r.get("text") or "").strip() or None
+        except Exception:
+            pass
+    return audio, int(sr), ref_text
+
+
+# ---------------------------------------------------------------------------
+# OmniVoice generation settings (language / num_step / position_temperature)
+# ---------------------------------------------------------------------------
+
+# Our language codes (the ones in the editor) that OmniVoice spells differently
+OMNI_LANG_ALIASES = {
+    "ar": "arb", "ne": "npi", "jw": "jv", "tl": "fil", "iw": "he", "or": "ory",
+    "zh-cn": "zh", "zh-tw": "zh", "zh-hans": "zh", "zh-hant": "zh",
+}
+OMNI_LANG_NAMES = {"mg": "plateau malagasy"}     # code → OmniVoice language NAME when it has no matching code
+_LANG_WARNED: set = set()
+
+
+def resolve_omni_language(code, logger: logging.Logger):
+    """Our language code ('te', 'hi', 'zh-CN', 'auto' …) → OmniVoice language id, or None.
+
+    None = language-agnostic mode (OmniVoice guesses from the text, as before). That is used
+    for 'auto' and for languages OmniVoice has no id for — a warning is logged once per code.
+    """
+    c = (code or "").strip().lower().replace("_", "-")
+    if not c or c in ("auto", "none", "unknown"):
+        return None
+    try:
+        from omnivoice.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
+    except Exception:
+        return OMNI_LANG_ALIASES.get(c, c)       # can't validate here — pass it on, OmniVoice resolves it
+    cand = [OMNI_LANG_ALIASES.get(c, c)]
+    base = c.split("-")[0]
+    cand.append(OMNI_LANG_ALIASES.get(base, base))
+    for x in cand:
+        if x in LANG_IDS:
+            return x
+    for x in (c, base):
+        nm = OMNI_LANG_NAMES.get(x)
+        if nm and nm in LANG_NAME_TO_ID:
+            return LANG_NAME_TO_ID[nm]
+    if c not in _LANG_WARNED:
+        _LANG_WARNED.add(c)
+        logger.warning(f"Language '{code}' has no OmniVoice language id — using language-agnostic mode for it.")
+    return None
+
+
+def job_target_language(job_dir: Path, config: dict):
+    """The job's target language: job_meta.json (set in the editor), else config.yaml language.target."""
+    try:
+        with open(Path(job_dir) / "job_meta.json", "r", encoding="utf-8") as f:
+            t = json.load(f).get("target_lang")
+        if t and str(t).strip().lower() != "auto":
+            return t
+    except Exception:
+        pass
+    return (config.get("language", {}) or {}).get("target")
+
+
+def generation_kwargs(tts_cfg: dict) -> dict:
+    """Generation settings taken from config.yaml (stages.tts). A key that is missing or empty is
+    simply not passed, so OmniVoice keeps its own default for it."""
+    kw = {}
+    if tts_cfg.get("num_step") not in (None, ""):
+        kw["num_step"] = int(tts_cfg["num_step"])
+    if tts_cfg.get("position_temperature") not in (None, ""):
+        kw["position_temperature"] = float(tts_cfg["position_temperature"])
+    return kw
+
+
+def omni_generate(model, logger: logging.Logger, **kwargs):
+    """model.generate(...) — and if the installed OmniVoice is too old to know `language`,
+    say so once and carry on without it instead of failing every line."""
+    try:
+        return model.generate(**kwargs)
+    except TypeError as e:
+        if "language" in kwargs and "language" in str(e):
+            if "language_unsupported" not in _LANG_WARNED:
+                _LANG_WARNED.add("language_unsupported")
+                logger.warning("This OmniVoice version does not accept `language` — continuing without it. "
+                               "(pip install -U omnivoice to enable it)")
+            kwargs.pop("language", None)
+            return model.generate(**kwargs)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
@@ -338,6 +506,9 @@ def synthesize_all(
     vocals_sr: int,
     config: dict[str, Any],
     logger: logging.Logger,
+    job_dir: Path | None = None,
+    text_lookup: dict[str, str] | None = None,
+    default_language: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Load OmniVoice once, synthesize all dialogues, release GPU.
@@ -350,12 +521,23 @@ def synthesize_all(
     tts_cfg          = config["stages"]["tts"]
     device           = config["hardware"]["device"] if config["hardware"]["gpu_available"] else "cpu"
     min_ref_duration = float(tts_cfg.get("min_ref_duration_s", 1.0))
+    gen_kw           = generation_kwargs(tts_cfg)          # num_step / position_temperature from config.yaml
 
     model = load_omnivoice_model(device, logger)
+    logger.info(
+        f"OmniVoice settings: {gen_kw or 'defaults'} | "
+        f"language: job target '{default_language or 'auto'}' (a dialogue's own target language wins)"
+    )
 
     dialogues_by_id = {d["id"]: d for d in dialogues}
     manifest_entries: list[dict[str, Any]] = []
     temp_files: list[str] = []
+    text_lookup = text_lookup or {}
+
+    def original_text(d: dict[str, Any]) -> str | None:
+        # 01_transcription.json is authoritative; 03_translations.json's copy can be stale
+        t = text_lookup.get(d.get("id"), d.get("text"))
+        return (t or "").strip() or None
 
     try:
         for dialogue in dialogues:
@@ -383,7 +565,15 @@ def synthesize_all(
             # ── Step 1: manual ref override (user-picked clip from UI) ─────
             ref_np, ref_src_sr, ref_source, ref_text = None, vocals_sr, None, None
             manual_ref_id = dialogue.get("manual_ref_audio")
-            if manual_ref_id:
+            if manual_ref_id and str(manual_ref_id).startswith(USER_REF_PREFIX):
+                # ── user-uploaded reference file ───────────────────────────
+                if job_dir is not None:
+                    u_np, u_sr, u_text = resolve_user_ref(job_dir, str(manual_ref_id), logger, d_id)
+                    if u_np is not None:
+                        ref_np, ref_src_sr, ref_text = u_np, u_sr, u_text
+                        ref_source = f"manual_ref:{manual_ref_id}"
+                        logger.info(f"[{d_id}] Using user-uploaded ref: {manual_ref_id}")
+            elif manual_ref_id:
                 ref_dlg = dialogues_by_id.get(manual_ref_id)
                 if ref_dlg:
                     ref_np, _reason = extract_dialogue_ref(
@@ -393,7 +583,7 @@ def synthesize_all(
                     )
                     if ref_np is not None:
                         ref_source = f"manual_ref:{manual_ref_id}"
-                        ref_text   = (ref_dlg.get("text") or "").strip() or None
+                        ref_text   = original_text(ref_dlg)
                         logger.info(f"[{d_id}] Using manual ref override: {manual_ref_id}")
                     else:
                         logger.warning(f"[{d_id}] manual_ref_audio '{manual_ref_id}' too short — falling back")
@@ -411,9 +601,24 @@ def synthesize_all(
                     logger=logger,
                     dialogue_id=d_id,
                 )
-                ref_source = "dialogue_slice"
-                # the dialogue's own slice says exactly the dialogue's own text
-                ref_text = (dialogue.get("text") or "").strip() or None
+                if ref_np is not None:
+                    ref_source = "dialogue_slice"
+                    # the dialogue's own slice says exactly the dialogue's own text
+                    ref_text = original_text(dialogue)
+                else:
+                    # Under the minimum length: don't give up on the line's own voice —
+                    # repeat the short clip (and its transcript) so it becomes long enough.
+                    short_np, _ = extract_dialogue_ref(
+                        vocals_audio=vocals_audio, vocals_sr=vocals_sr, start_ms=start_ms, end_ms=end_ms,
+                        min_ref_duration_s=SHORT_REF_FLOOR_S, logger=logger, dialogue_id=d_id,
+                    )
+                    if short_np is not None:
+                        ref_text = original_text(dialogue)
+                        ref_np, ref_text, reps = repeat_short_ref(short_np, vocals_sr, ref_text, min_ref_duration)
+                        ref_src_sr = vocals_sr
+                        ref_source = f"dialogue_slice_x{reps}"
+                        logger.info(f"[{d_id}] Short line ({len(short_np)/vocals_sr:.2f}s): ref repeated {reps}x"
+                                    f"{' with transcript repeated' if ref_text else ''}")
 
             # ── Step 3: fallback to speaker profile if still nothing ────────
             if ref_np is None:
@@ -426,6 +631,7 @@ def synthesize_all(
                         str(fallback_path), sr=None, mono=True
                     )
                     ref_source = f"speaker_profile:{fallback_path.name}"
+                    ref_text   = None   # profile = many lines joined; no single transcript
                     logger.info(
                         f"[{d_id}] Using fallback ref: {fallback_path.name}"
                     )
@@ -437,6 +643,13 @@ def synthesize_all(
                         "error": "no_ref_audio", "tts_text": text,
                     })
                     continue
+
+            # prepare_ref_audio() keeps only the first 10 s; the transcript would
+            # then describe more audio than OmniVoice receives, so drop it and
+            # let OmniVoice transcribe what it is actually given.
+            if ref_text and len(ref_np) / float(ref_src_sr) > MAX_REF_SECONDS:
+                logger.info(f"[{d_id}] Ref is longer than {MAX_REF_SECONDS:.0f}s and will be trimmed — ref_text dropped")
+                ref_text = None
 
             # ── Step 3: prepare ref for OmniVoice ──────────────────────────
             try:
@@ -460,11 +673,21 @@ def synthesize_all(
             # cloning off a possibly-mistranscribed ref). Left unset for the
             # speaker-profile fallback since that's a concatenation of many
             # different lines with no single accurate transcript.
+            # Language of the TEXT being spoken = the dialogue's own target language if the user
+            # set one in the editor, otherwise the job's target language.
+            d_lang = dialogue.get("target_lang")
+            if not d_lang or str(d_lang).strip().lower() == "auto":
+                d_lang = default_language
+            omni_lang = resolve_omni_language(d_lang, logger)
+            logger.info(f"[{d_id}] language={omni_lang or 'auto'} | {gen_kw or 'default settings'}")
             try:
-                audio_list = model.generate(
+                audio_list = omni_generate(
+                    model, logger,
                     text=text,
+                    language=omni_lang,
                     ref_audio=prepared_ref,
                     ref_text=ref_text,
+                    **gen_kw,
                 )
                 audio = np.array(audio_list[0], dtype=np.float32)
             except Exception as e:
@@ -502,11 +725,12 @@ def synthesize_all(
             manifest_entries.append({
                 "id":                      d_id,
                 "speaker_id":              speaker_id,
-                "wav_path":                str(wav_path),
+                "wav_path":                f"04_tts/{wav_path.name}",   # relative to the job folder (portable)
                 "original_duration_ms":    float(end_ms - start_ms),
                 "synthesized_duration_ms": round(synthesized_duration_ms, 1),
                 "ref_source":              ref_source,
                 "tts_text":                text,
+                "language":                omni_lang,        # what OmniVoice was told (None = auto)
                 "success":                 True,
             })
 
@@ -534,9 +758,10 @@ def main() -> None:
     project_root = Path(args.config).parent.resolve()
     os.chdir(project_root)
 
-    logs_dir = config["paths"]["logs"]
     jobs_dir = config["paths"]["jobs"]
-    audio_dir = project_root / config["paths"]["data_audio"]
+    jp.migrate_legacy_job(project_root, jobs_dir, args.job_id)
+    job_dir_ = jp.job_dir(project_root, jobs_dir, args.job_id)
+    logs_dir = str(jp.logs_dir(job_dir_))
 
     logger = setup_logging(args.job_id, logs_dir)
     logger.info("=" * 60)
@@ -572,7 +797,7 @@ def main() -> None:
     logger.info(f"Loaded {len(dialogues)} dialogues")
 
     # Load vocals WAV for ref audio slicing
-    vocals_path = audio_dir / f"{args.job_id}_vocals.wav"
+    vocals_path = jp.vocals_wav(job_dir_)
     if not vocals_path.exists():
         logger.warning(
             f"_vocals.wav not found at {vocals_path} — "
@@ -616,6 +841,9 @@ def main() -> None:
             vocals_sr=vocals_sr,
             config=config,
             logger=logger,
+            job_dir=Path(jobs_dir) / args.job_id,
+            text_lookup=load_original_text_lookup(jobs_dir, args.job_id),
+            default_language=job_target_language(Path(jobs_dir) / args.job_id, config),
         )
     except Exception as e:
         logger.error(f"Synthesis failed: {e}", exc_info=True)

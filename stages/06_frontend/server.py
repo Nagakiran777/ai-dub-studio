@@ -11,7 +11,7 @@ All fixes:
   - Run vs Resume based on manifest state
 """
 from __future__ import annotations
-import asyncio, gc, io, json, logging, os, shutil, sys, time, wave as wave_mod
+import asyncio, gc, io, json, logging, os, re, shutil, subprocess, sys, time, uuid, wave as wave_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,10 +21,12 @@ import uvicorn, yaml
 # preview and the exported video always agree. Lives in stages/_shared/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
 try:
-    from dub_speed import auto_speed, effective_speed
+    from dub_speed import auto_speed, effective_speed, dub_geometry, dub_parts_geometry
+    import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
+    import dub_volume
 except ImportError as _e:  # pragma: no cover
     raise RuntimeError("stages/_shared/dub_speed.py not found — copy the _shared folder next to the other stage folders") from _e
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,11 +36,9 @@ from pydantic import BaseModel
 PROJECT_ROOT = Path("/mnt/d/$/my/dubbing_V2")
 CONFIG_PATH  = PROJECT_ROOT / "config.yaml"
 JOBS_DIR     = PROJECT_ROOT / "jobs"
-AUDIO_DIR    = PROJECT_ROOT / "data" / "audio"
-INPUT_DIR    = PROJECT_ROOT / "data" / "input"
-OUTPUT_DIR   = PROJECT_ROOT / "data" / "outputs"
+INBOX_DIR    = JOBS_DIR / "_inbox"          # uploaded videos waiting to become a job (no root-level data/ folder any more)
+LEGACY_INPUT = PROJECT_ROOT / "data" / "input"   # old videos folder — still listed if it exists
 STAGES_DIR   = PROJECT_ROOT / "stages"
-LOGS_DIR     = PROJECT_ROOT / "logs"
 CONDA_BIN    = "/home/jani/miniconda3/bin/conda"
 CONDA_PATH   = "/home/jani/miniconda3/bin:/home/jani/miniconda3/condabin"
 
@@ -73,7 +73,20 @@ def save_json_file(path: Path, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def get_job_dir(job_id: str) -> Path: return JOBS_DIR / job_id
+_MIGRATED: set = set()
+def get_job_dir(job_id: str) -> Path:
+    """jobs/<job_id>/ — the one folder that holds everything of this job. A job made by an
+    older version (audio in data/audio, export in data/outputs …) is moved in on first use."""
+    jd = JOBS_DIR / job_id
+    if job_id not in _MIGRATED and jd.is_dir() and not job_id.startswith("_"):
+        _MIGRATED.add(job_id)
+        try: jp.migrate_legacy_job(PROJECT_ROOT, "jobs", job_id)
+        except Exception as e: logging.getLogger("server").warning(f"migrate {job_id}: {e}")
+    return jd
+
+def job_audio(job_id: str, kind: str) -> Path:
+    jd = get_job_dir(job_id)
+    return {"vocals": jp.vocals_wav, "no_vocals": jp.no_vocals_wav, "original": jp.original_wav}[kind](jd)
 
 def get_manifest(job_id: str) -> dict:
     p = get_job_dir(job_id) / "manifest.json"
@@ -107,7 +120,7 @@ def list_jobs():
     if not JOBS_DIR.exists(): return []
     jobs = []
     for d in sorted(JOBS_DIR.iterdir(), reverse=True):
-        if not d.is_dir(): continue
+        if not d.is_dir() or d.name.startswith("_"): continue
         mp = d / "job_meta.json"
         if mp.exists():
             meta = load_json_file(mp)
@@ -134,10 +147,21 @@ def create_job(req: NewJobReq):
     job_id = f"{vp.stem}_{ts}"
     jd     = JOBS_DIR / job_id
     jd.mkdir(parents=True, exist_ok=True)
+    jp.ensure_layout(jd)
+    # The video moves INTO the job (source/), so the job folder holds everything and can be zipped.
+    dest = jp.source_dir(jd) / vp.name
+    try:
+        if INBOX_DIR in vp.resolve().parents: shutil.move(str(vp), str(dest))    # was just uploaded → no duplicate
+        else: shutil.copy2(str(vp), str(dest))                                     # picked from an existing folder → keep the original
+    except Exception as e:
+        raise HTTPException(500, f"Could not copy the video into the job folder: {e}")
+    (jd / jp.LAYOUT_MARK).write_text("2", encoding="utf-8")
+    rel = f"{jp.SOURCE_DIR}/{dest.name}"
     save_json_file(jd / "job_meta.json", {
-        "job_id": job_id, "input_video": str(vp), "input_file": str(vp),
+        "job_id": job_id, "input_video": rel, "input_file": rel,
         "created_at": datetime.now().isoformat(), "status": "created",
         "source_lang": "auto", "target_lang": "en",
+        "asr_model": "medium",          # Whisper model for the speech-recognition stage (medium = recommended)
     })
     save_json_file(jd / "manifest.json", {
         "job_id": job_id, "stages": {
@@ -162,14 +186,16 @@ async def save_language(job_id: str, req: LangReq):
 
 @app.get("/api/input_videos")
 def list_videos():
-    if not INPUT_DIR.exists(): return []
-    VIDEO_EXTS = {'.mp4','.mkv','.avi','.mov','.webm','.flv','.m4v','.ts','.wmv'}
-    return [{"name": f.name, "path": str(f)} for f in sorted(INPUT_DIR.iterdir()) if f.suffix.lower() in VIDEO_EXTS]
+    out = []
+    for folder in (INBOX_DIR, LEGACY_INPUT):
+        if folder.exists():
+            out += [{"name": f.name, "path": str(f)} for f in sorted(folder.iterdir()) if f.suffix.lower() in jp.VIDEO_EXTS]
+    return out
 
 @app.post("/api/upload_video")
 async def upload_video(file: UploadFile = File(...)):
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    dest = INPUT_DIR / file.filename
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    dest = INBOX_DIR / Path(file.filename or "upload.mp4").name
     with open(dest, "wb") as f: shutil.copyfileobj(file.file, f)
     return {"name": file.filename, "path": str(dest)}
 
@@ -312,11 +338,50 @@ def get_tts(job_id: str):
         orig = float(t.get("end_ms", 0)) - float(t.get("start_ms", 0))
         dub  = e.get("synthesized_duration_ms")
         manual = t.get("dub_speed")
-        e["original_ms"]  = orig
-        e["speed_auto"]   = auto_speed(dub, orig)
-        e["speed_manual"] = manual
-        e["speed"]        = effective_speed(manual, dub, orig)
+        # One shared calculation (stages/_shared/dub_speed.py) for placement, trim,
+        # speed and final length — Stage 05 uses the very same function.
+        g = dub_geometry(dub, t, float(t.get("start_ms", 0)), float(t.get("end_ms", 0)))
+        e["original_ms"]   = orig
+        e["speed_auto"]    = g["speed_fit"]      # value behind the "Fit to original" button
+        e["speed_manual"]  = manual
+        e["speed"]         = g["speed"]          # default 1.0 unless the user set one
+        e["natural_ms"]    = g["natural_ms"]
+        e["trim_in_ms"]    = g["trim_in_ms"]
+        e["trim_out_ms"]   = g["trim_out_ms"]
+        e["kept_ms"]       = g["kept_ms"]
+        e["dub_start_ms"]  = g["dub_start_ms"]
+        e["dub_len_ms"]    = g["dub_len_ms"]
+        e["dub_end_ms"]    = g["dub_end_ms"]
+        e["dub_deleted"]   = g["deleted"]
+        e["dub_moved"]     = g["moved"]
+        e["dub_trimmed"]   = g["trimmed"]
+        # every piece the dub has been cut into (piece "p0" = the dialogue's own dub)
+        e["parts"]         = dub_parts_geometry(dub, t, float(t.get("start_ms", 0)), float(t.get("end_ms", 0)))
+        # loudness: the gain that makes this dub as loud as ITS original line — same rule as the export
+        # dub_volume = what the user set for THIS dialogue (1.0 = natural level). Nothing is
+        # normalized automatically; volume_gain is only the value behind "Match to original".
+        dv = t.get("dub_volume")
+        e["dub_volume"] = 1.0 if dv is None else max(0.0, min(4.0, float(dv)))
+        vg = _volume_gain(job_id, e, t)
+        if vg:
+            e["volume_gain"] = vg["gain"]; e["orig_rms"] = vg["orig_rms"]; e["dub_rms"] = vg["dub_rms"]
     return d
+
+_VOL_CACHE: Dict[tuple, Optional[dict]] = {}
+def _volume_gain(job_id: str, e: dict, t: dict) -> Optional[dict]:
+    """Cached per (original window, dub file, vocals file) so a refresh doesn't re-measure everything."""
+    jd = get_job_dir(job_id)
+    wav = jp.resolve_job_file(jd, e.get("wav_path") or "", "04_tts")
+    voc = jp.vocals_wav(jd)
+    if wav is None or not voc.exists(): return None
+    try:
+        key = (job_id, e.get("id"), int(t.get("start_ms", 0)), int(t.get("end_ms", 0)),
+               wav.stat().st_mtime_ns, voc.stat().st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _VOL_CACHE:
+        _VOL_CACHE[key] = dub_volume.dialogue_gain(voc, float(t.get("start_ms", 0)), float(t.get("end_ms", 0)), wav)
+    return _VOL_CACHE[key]
 
 # ---------------------------------------------------------------------------
 # Dialogue CRUD
@@ -328,7 +393,9 @@ class DlgUpdateReq(BaseModel):
 # vice versa. Fields not listed here are treated as shared (written to both,
 # same as before) since start_ms/end_ms/speaker_id legitimately live in both files.
 TRANSCRIPTION_ONLY_FIELDS = {"text", "is_nonlexical", "words"}
-TRANSLATIONS_ONLY_FIELDS  = {"translation", "is_passthrough", "manual_ref_audio", "source_lang", "target_lang", "dub_speed"}
+TRANSLATIONS_ONLY_FIELDS  = {"translation", "is_passthrough", "manual_ref_audio", "source_lang", "target_lang", "dub_speed",
+                             # dub placement / trim / removal — independent of the original bar, never stale the TTS
+                             "dub_start_ms", "dub_trim_start_ms", "dub_trim_end_ms", "dub_deleted", "dub_parts", "dub_volume"}
 # Fields that, if a TTS take already exists for this dialogue, make that take
 # no longer match (different words, different ref-audio slice, different
 # speaker/voice) — flagged as stale rather than silently left looking "done".
@@ -343,6 +410,21 @@ def mark_tts_stale(job_id: str, dialogue_id: str) -> None:
         if e.get("id") == dialogue_id and e.get("success") and not e.get("stale"):
             e["stale"] = True
             changed = True
+    if changed: save_json_file(p, data)
+
+def reset_dub_trims(job_id: str, dialogue_id: Optional[str] = None) -> None:
+    """A freshly synthesized clip has a different length, so trim points that were
+    set on the OLD clip no longer mean anything — clear them (speed and position stay)."""
+    p = get_job_dir(job_id) / "03_translations.json"
+    if not p.exists(): return
+    data = load_json_file(p); changed = False
+    for d in data.get("dialogues", []):
+        if dialogue_id is not None and d.get("id") != dialogue_id: continue
+        for k in ("dub_trim_start_ms", "dub_trim_end_ms"):
+            if d.get(k) is not None:
+                d[k] = None; changed = True
+        if d.get("dub_parts"):          # pieces were cut from the OLD clip — gone with it
+            d["dub_parts"] = None; changed = True
     if changed: save_json_file(p, data)
 
 def remove_tts_entry(job_id: str, dialogue_id: str) -> None:
@@ -360,8 +442,28 @@ def remove_tts_entry(job_id: str, dialogue_id: str) -> None:
         try: wav.unlink()
         except Exception: pass
 
+def freeze_dub_start(job_id: str, dialogue_id: str, fields: Dict[str, Any]) -> None:
+    """The dub bar and the original bar are independent. A dub that has never
+    been placed by hand simply sits at the original's start — so when the
+    ORIGINAL start is about to move, pin the dub where it is now; otherwise
+    dragging the original bar would silently drag the dub with it."""
+    if "start_ms" not in fields: return
+    jd = get_job_dir(job_id)
+    tp, mp = jd / "03_translations.json", jd / "04_tts" / "tts_manifest.json"
+    if not tp.exists() or not mp.exists(): return
+    if not any(e.get("id") == dialogue_id and e.get("success") for e in load_json_file(mp).get("dialogues", [])): return
+    data = load_json_file(tp); changed = False
+    for d in data.get("dialogues", []):
+        if d.get("id") != dialogue_id or d.get("dub_start_ms") is not None: continue
+        try: new_start = float(fields["start_ms"])
+        except (TypeError, ValueError): continue
+        if float(d.get("start_ms", 0)) != new_start:
+            d["dub_start_ms"] = d.get("start_ms", 0); changed = True
+    if changed: save_json_file(tp, data)
+
 @app.post("/api/jobs/{job_id}/dialogue/update")
 async def update_dialogue(job_id: str, req: DlgUpdateReq):
+    freeze_dub_start(job_id, req.dialogue_id, {req.field: req.value})
     targets = ["01_transcription.json", "03_translations.json"]
     if req.field in TRANSCRIPTION_ONLY_FIELDS:
         targets = ["01_transcription.json"]
@@ -387,6 +489,7 @@ class DlgUpdateManyReq(BaseModel):
 async def update_dialogue_many(job_id: str, req: DlgUpdateManyReq):
     """Apply several field changes to one dialogue in a single write per file
     and a single broadcast — used by drag-and-drop (time and/or speaker)."""
+    freeze_dub_start(job_id, req.dialogue_id, req.fields)
     jd = get_job_dir(job_id)
     for fname in ["01_transcription.json", "03_translations.json"]:
         p = jd / fname
@@ -550,6 +653,115 @@ async def set_ref(job_id: str, req: SetRefReq):
     await broadcast(job_id, {"type": "dialogue_updated", "dialogue_id": req.dialogue_id})
     return {"ok": True}
 
+class SetRefSpeakerReq(BaseModel):
+    speaker_id: str; ref_audio: str
+
+@app.post("/api/jobs/{job_id}/dialogue/set_ref_speaker")
+async def set_ref_speaker(job_id: str, req: SetRefSpeakerReq):
+    """Use one reference (e.g. an uploaded voice file) for EVERY line of a speaker."""
+    p = get_job_dir(job_id) / "03_translations.json"
+    if not p.exists(): raise HTTPException(404)
+    data = load_json_file(p); n = 0
+    for d in data.get("dialogues", []):
+        if d.get("speaker_id") == req.speaker_id:
+            d["manual_ref_audio"] = req.ref_audio; n += 1
+    save_json_file(p, data)
+    await broadcast(job_id, {"type": "dialogue_updated", "dialogue_id": None})
+    return {"ok": True, "updated": n}
+
+# ---------------------------------------------------------------------------
+# User-uploaded reference voices — jobs/<job>/user_refs/<id>.wav + index.json
+# A dialogue uses one by setting manual_ref_audio = "user:<id>".
+REF_ID_RE      = re.compile(r"^[A-Za-z0-9_-]+$")
+USER_REF_MAX_S = 30            # only the first 30 s of an upload is kept (TTS uses ≤10 s anyway)
+
+def _user_refs_dir(job_id: str) -> Path: return get_job_dir(job_id) / "user_refs"
+
+def _load_user_refs(job_id: str) -> List[dict]:
+    p = _user_refs_dir(job_id) / "index.json"
+    return load_json_file(p).get("refs", []) if p.exists() else []
+
+def _save_user_refs(job_id: str, refs: List[dict]) -> None:
+    d = _user_refs_dir(job_id); d.mkdir(parents=True, exist_ok=True)
+    save_json_file(d / "index.json", {"refs": refs})
+
+def _user_ref_public(job_id: str, r: dict) -> dict:
+    return {**r, "value": f"user:{r['id']}", "url": f"/api/jobs/{job_id}/user_refs/{r['id']}/audio"}
+
+@app.get("/api/jobs/{job_id}/user_refs")
+def list_user_refs(job_id: str):
+    return [_user_ref_public(job_id, r) for r in _load_user_refs(job_id)]
+
+@app.post("/api/jobs/{job_id}/user_refs")
+async def upload_user_ref(job_id: str, file: UploadFile = File(...), text: str = Form("")):
+    """Accepts any audio (or video) file ffmpeg can read — wav, mp3, m4a, flac, ogg,
+    opus, aac, wma, mp4, mkv … — and stores it as mono 24 kHz WAV for OmniVoice."""
+    if not get_job_dir(job_id).exists(): raise HTTPException(404, "Unknown job")
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(500, "ffmpeg was not found on this machine, so the file can't be converted")
+    d = _user_refs_dir(job_id); d.mkdir(parents=True, exist_ok=True)
+    ref_id = f"uref_{uuid.uuid4().hex[:8]}"
+    ext = Path(file.filename or "").suffix[:10] or ".bin"
+    raw = d / f"{ref_id}_upload{ext}"
+    out = d / f"{ref_id}.wav"
+    try:
+        with open(raw, "wb") as f: shutil.copyfileobj(file.file, f)
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-i", str(raw), "-vn", "-ac", "1", "-ar", "24000",
+             "-t", str(USER_REF_MAX_S), "-c:a", "pcm_s16le", str(out)],
+            capture_output=True, text=True)
+        if proc.returncode != 0 or not out.exists():
+            tail = (proc.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+            raise HTTPException(400, f"That file couldn't be read as audio ({tail[0][:140]})")
+        with wave_mod.open(str(out), "rb") as wf:
+            dur_ms = int(wf.getnframes() / float(wf.getframerate()) * 1000)
+        if dur_ms < 500:
+            out.unlink(missing_ok=True)
+            raise HTTPException(400, "That audio is shorter than 0.5 s — use a clip with a few seconds of clear speech")
+    finally:
+        raw.unlink(missing_ok=True)
+    refs = _load_user_refs(job_id)
+    refs.append({"id": ref_id, "name": file.filename or ref_id, "duration_ms": dur_ms,
+                 "text": (text or "").strip(), "created_at": datetime.now(timezone.utc).isoformat()})
+    _save_user_refs(job_id, refs)
+    return {"ok": True, **_user_ref_public(job_id, refs[-1])}
+
+@app.get("/api/jobs/{job_id}/user_refs/{ref_id}/audio")
+def serve_user_ref(job_id: str, ref_id: str):
+    if not REF_ID_RE.match(ref_id): raise HTTPException(400)
+    p = _user_refs_dir(job_id) / f"{ref_id}.wav"
+    if not p.exists(): raise HTTPException(404)
+    return FileResponse(str(p), media_type="audio/wav")
+
+class UserRefTextReq(BaseModel):
+    text: str
+
+@app.post("/api/jobs/{job_id}/user_refs/{ref_id}/text")
+def set_user_ref_text(job_id: str, ref_id: str, req: UserRefTextReq):
+    """What is said in the uploaded clip (optional — skips OmniVoice's own transcription of it)."""
+    refs = _load_user_refs(job_id)
+    for r in refs:
+        if r["id"] == ref_id: r["text"] = req.text.strip()
+    _save_user_refs(job_id, refs)
+    return {"ok": True}
+
+@app.delete("/api/jobs/{job_id}/user_refs/{ref_id}")
+async def delete_user_ref(job_id: str, ref_id: str):
+    if not REF_ID_RE.match(ref_id): raise HTTPException(400)
+    (_user_refs_dir(job_id) / f"{ref_id}.wav").unlink(missing_ok=True)
+    _save_user_refs(job_id, [r for r in _load_user_refs(job_id) if r["id"] != ref_id])
+    # any dialogue that pointed at it goes back to Auto
+    p = get_job_dir(job_id) / "03_translations.json"
+    if p.exists():
+        data = load_json_file(p); changed = False
+        for d in data.get("dialogues", []):
+            if d.get("manual_ref_audio") == f"user:{ref_id}":
+                d["manual_ref_audio"] = ""; changed = True
+        if changed: save_json_file(p, data)
+    await broadcast(job_id, {"type": "dialogue_updated", "dialogue_id": None})
+    return {"ok": True}
+
 # ---------------------------------------------------------------------------
 # Speakers
 @app.get("/api/jobs/{job_id}/speakers")
@@ -648,7 +860,7 @@ async def build_profiles(job_id: str):
     jd         = get_job_dir(job_id)
     trans_path = jd / "01_transcription.json"
     if not trans_path.exists(): raise HTTPException(404, "transcription not found")
-    vocals_path = AUDIO_DIR / f"{job_id}_vocals.wav"
+    vocals_path = job_audio(job_id, "vocals")
     if not vocals_path.exists(): raise HTTPException(404, f"vocals WAV not found — run Stage 00 first")
 
     data      = load_json_file(trans_path)
@@ -721,15 +933,47 @@ async def _rerun_tts(job_id: str, dlg_id: str):
     async for line in proc.stdout:
         await broadcast(job_id, {"type":"log","stage":"04_tts_rerun","text":line.decode(errors="replace").rstrip()})
     await proc.wait()
+    if proc.returncode == 0: reset_dub_trims(job_id, dlg_id)
     t = "tts_rerun_complete" if proc.returncode==0 else "tts_rerun_failed"
     await broadcast(job_id, {"type": t, "dialogue_id": dlg_id})
 
+# Whisper models the user can pick. "medium" is the default and the recommended one;
+# "large-v3" is the optional heavier choice when the transcription isn't good.
+ASR_MODELS      = ("medium", "large-v3")
+ASR_MODEL_DEFAULT = "medium"
+
+def _clean_asr_model(m: Optional[str]) -> str:
+    m = (m or "").strip().lower()
+    return m if m in ASR_MODELS else ASR_MODEL_DEFAULT
+
+class AsrModelReq(BaseModel):
+    model: str
+
+@app.get("/api/jobs/{job_id}/asr_model")
+def get_asr_model(job_id: str):
+    mp = get_job_dir(job_id) / "job_meta.json"
+    if not mp.exists(): raise HTTPException(404)
+    return {"model": _clean_asr_model(load_json_file(mp).get("asr_model")), "models": list(ASR_MODELS), "default": ASR_MODEL_DEFAULT}
+
+@app.post("/api/jobs/{job_id}/asr_model")
+def set_asr_model(job_id: str, req: AsrModelReq):
+    """The model for the WHOLE speech-recognition stage of this job (all dialogues)."""
+    if req.model.strip().lower() not in ASR_MODELS: raise HTTPException(400, f"Model must be one of {ASR_MODELS}")
+    mp = get_job_dir(job_id) / "job_meta.json"
+    if not mp.exists(): raise HTTPException(404)
+    meta = load_json_file(mp); meta["asr_model"] = req.model.strip().lower(); save_json_file(mp, meta)
+    return {"ok": True, "model": meta["asr_model"]}
+
+class AsrRerunReq(BaseModel):
+    dialogue_id: str
+    model: Optional[str] = None      # for THIS dialogue only; independent of the job's model
+
 @app.post("/api/jobs/{job_id}/asr/rerun")
-async def rerun_asr(job_id: str, req: RerunReq):
-    asyncio.create_task(_rerun_asr(job_id, req.dialogue_id))
+async def rerun_asr(job_id: str, req: AsrRerunReq):
+    asyncio.create_task(_rerun_asr(job_id, req.dialogue_id, _clean_asr_model(req.model) if req.model else None))
     return {"ok": True}
 
-async def _rerun_asr(job_id: str, dlg_id: str):
+async def _rerun_asr(job_id: str, dlg_id: str, model: Optional[str] = None):
     await broadcast(job_id, {"type": "asr_rerun_started", "dialogue_id": dlg_id})
     script = STAGES_DIR / "01_asr" / "rerun_single.py"
     if not script.exists():
@@ -738,6 +982,7 @@ async def _rerun_asr(job_id: str, dlg_id: str):
     env = os.environ.copy(); env["PATH"] = f"{CONDA_PATH}:{env.get('PATH','')}"
     cmd = [CONDA_BIN,"run","--no-capture-output","-n","dub_asr","python",str(script),
            "--job_id",job_id,"--dialogue_id",dlg_id,"--config",str(CONFIG_PATH)]
+    if model: cmd += ["--model", model]
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
            stderr=asyncio.subprocess.STDOUT, env=env, cwd=str(PROJECT_ROOT))
     async for line in proc.stdout:
@@ -862,8 +1107,44 @@ async def run_single_stage_endpoint(job_id: str, req: RunStageReq):
     pipeline_tasks[job_id] = asyncio.create_task(_run_single_stage(job_id, req.stage_id))
     return {"ok": True}
 
+def reset_stages_from(job_id: str, sid: str) -> List[str]:
+    """Re-running a stage: mark it AND every stage after it as pending in manifest.json.
+
+    Every stage script is restart-safe — it looks at the manifest and, if its own stage says
+    "completed", exits at once ("already completed"). So a re-run must first flip the manifest
+    back to pending, otherwise the script just quits and nothing is re-done. Stages after it are
+    built on its OLD output, so they go back to pending too; stages before it are never touched.
+    """
+    manifest = get_manifest(job_id)
+    order = [s["id"] for s in STAGES]
+    reset = []
+    for later in order[order.index(sid):]:
+        entry = manifest["stages"].setdefault(later, {})
+        entry["status"] = "pending"
+        entry["completed_at"] = None
+        entry["failed_at"] = None
+        reset.append(later)
+    save_manifest(job_id, manifest)
+    return reset
+
+def purge_stage_outputs(job_id: str, sid: str) -> None:
+    """Some stages also skip work when their output files already exist (vocals separation checks
+    for finished vocals/no_vocals files and resumes from saved chunks). A forced re-run must start
+    from scratch, so those leftovers go first. Everything else a stage writes is simply overwritten."""
+    jd = get_job_dir(job_id)
+    if sid == "00_vocals":
+        for p in (jp.vocals_wav(jd), jp.no_vocals_wav(jd), jd / "00_vocals_progress.json"):
+            try: p.unlink(missing_ok=True)
+            except Exception: pass
+        shutil.rmtree(jd / "00_vocals_chunks", ignore_errors=True)
+
 async def _run_single_stage(job_id: str, sid: str):
     stage = next(s for s in STAGES if s["id"] == sid)
+    # Flip the manifest to pending FIRST (this stage + all later ones) — otherwise the stage script
+    # sees "completed" and exits without doing anything.
+    reset = reset_stages_from(job_id, sid)
+    purge_stage_outputs(job_id, sid)
+    await broadcast(job_id, {"type": "stages_reset", "stages": reset})
     await broadcast(job_id, {"type": "stage_started", "stage": sid})
     ok = await _run_stage(job_id, sid, stage["env"])
     if not ok:
@@ -903,6 +1184,7 @@ async def _run_stage(job_id: str, sid: str, env_name: str) -> bool:
         src  = meta.get("source_lang","")
         tgt  = meta.get("target_lang","")
         if sid == "01_asr" and src:          cmd += ["--source_lang", src]
+        if sid == "01_asr":                  cmd += ["--asr_model", _clean_asr_model(meta.get("asr_model"))]   # the job's model (default: medium)
         if sid == "03_translation":
             if src: cmd += ["--source_lang", src]
             if tgt: cmd += ["--target_lang",  tgt]
@@ -910,7 +1192,9 @@ async def _run_stage(job_id: str, sid: str, env_name: str) -> bool:
            stderr=asyncio.subprocess.STDOUT, env=env, cwd=str(PROJECT_ROOT))
     async for line in proc.stdout:
         await broadcast(job_id, {"type":"log","stage":sid,"text":line.decode(errors="replace").rstrip()})
-    await proc.wait(); return proc.returncode == 0
+    await proc.wait()
+    if proc.returncode == 0 and sid == "04_tts": reset_dub_trims(job_id)
+    return proc.returncode == 0
 
 # ---------------------------------------------------------------------------
 # Export
@@ -929,27 +1213,222 @@ async def _run_export(job_id: str):
         m["stages"]["05_assembly"]["status"]       = "completed"
         m["stages"]["05_assembly"]["completed_at"] = datetime.now(timezone.utc).isoformat()
         save_manifest(job_id, m)
-        out = OUTPUT_DIR / f"{job_id}_dubbed.mp4"
-        await broadcast(job_id, {"type":"export_complete","download_url":f"/api/jobs/{job_id}/download","exists":out.exists()})
+        out = _final_output(job_id)
+        await broadcast(job_id, {"type":"export_complete","download_url":f"/api/jobs/{job_id}/download","exists":out is not None})
     else:
         await broadcast(job_id, {"type":"export_failed"})
 
+def _final_output(job_id: str) -> Optional[Path]:
+    """The exported file — .mkv or .mp4 depending on what the original needed (newest wins)."""
+    od = jp.output_dir(get_job_dir(job_id))
+    found = [p for p in (od / f"{job_id}_dubbed.mkv", od / f"{job_id}_dubbed.mp4") if p.exists()]
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
 @app.get("/api/jobs/{job_id}/download")
 def download(job_id: str):
-    p = OUTPUT_DIR / f"{job_id}_dubbed.mp4"
-    if not p.exists(): raise HTTPException(404)
-    return FileResponse(str(p), media_type="video/mp4", filename=f"{job_id}_dubbed.mp4")
+    p = _final_output(job_id)
+    if not p: raise HTTPException(404)
+    return FileResponse(str(p), media_type="video/x-matroska" if p.suffix == ".mkv" else "video/mp4", filename=p.name)
+
+# ---------------------------------------------------------------------------
+# Mixer — how loud the three layers are (background, vocals, dubbed). Used by the preview
+# AND by the export (Stage 05 reads the same file), so both sound the same.
+MIX_DEFAULT = {"no_vocals": 1.0, "vocals": 1.0, "dub": 1.0}
+
+class MixReq(BaseModel):
+    no_vocals: Optional[float] = None
+    vocals:    Optional[float] = None
+    dub:       Optional[float] = None
+
+def _read_mix(job_id: str) -> dict:
+    p = get_job_dir(job_id) / "mix.json"
+    mix = dict(MIX_DEFAULT)
+    if p.exists():
+        try:
+            for k, v in load_json_file(p).items():
+                if k in mix: mix[k] = max(0.0, min(4.0, float(v)))
+        except Exception: pass
+    return mix
+
+@app.get("/api/jobs/{job_id}/mix")
+def get_mix(job_id: str): return _read_mix(job_id)
+
+@app.post("/api/jobs/{job_id}/mix")
+def set_mix(job_id: str, req: MixReq):
+    if not (get_job_dir(job_id) / "job_meta.json").exists(): raise HTTPException(404)
+    mix = _read_mix(job_id)
+    for k in MIX_DEFAULT:
+        v = getattr(req, k)
+        if v is not None: mix[k] = max(0.0, min(4.0, float(v)))
+    save_json_file(get_job_dir(job_id) / "mix.json", mix)
+    return mix
+
+# ---------------------------------------------------------------------------
+# Zip the present work / import a zip — a job folder is self-contained, so it can be shared
+# and resumed anywhere. Browser viewing copies are left out (they are re-made on demand).
+import tempfile, zipfile
+from starlette.background import BackgroundTask
+
+ZIP_SKIP_NAMES   = {"preview.mp4", "assembled_preview.mp4", "05_dubbed_audio_temp.wav", jp.LAYOUT_MARK}
+ZIP_STORED_EXTS  = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".zip"}
+
+@app.get("/api/jobs/{job_id}/zip")
+def zip_job(job_id: str):
+    """The whole job folder as one .zip — video, audio tracks, every JSON, TTS clips, speaker
+    profiles, uploaded refs, the export. Drop it into any AI Dub Studio (Import) to continue."""
+    jd = get_job_dir(job_id)
+    if not (jd / "job_meta.json").exists(): raise HTTPException(404, "Unknown job")
+    tmp = tempfile.NamedTemporaryFile(prefix=f"{job_id}_", suffix=".zip", delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", allowZip64=True) as zf:
+            for f in sorted(jd.rglob("*")):
+                if not f.is_file(): continue
+                rel = f.relative_to(jd)
+                if f.name in ZIP_SKIP_NAMES or f.name.endswith(".part.mp4") or "__pycache__" in rel.parts: continue
+                method = zipfile.ZIP_STORED if f.suffix.lower() in ZIP_STORED_EXTS else zipfile.ZIP_DEFLATED
+                zf.write(f, arcname=f"{job_id}/{rel.as_posix()}", compress_type=method)
+    except Exception as e:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise HTTPException(500, f"Could not create the zip: {e}")
+    return FileResponse(tmp.name, media_type="application/zip", filename=f"{job_id}.zip",
+                        background=BackgroundTask(lambda: Path(tmp.name).unlink(missing_ok=True)))
+
+@app.post("/api/jobs/import_zip")
+async def import_job_zip(file: UploadFile = File(...)):
+    """Unpack a job zip made by 'Zip this job' into jobs/ and return its id, ready to continue."""
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="_import_", dir=str(INBOX_DIR)))
+    try:
+        zpath = work / "upload.zip"
+        with open(zpath, "wb") as f: shutil.copyfileobj(file.file, f)
+        if not zipfile.is_zipfile(zpath): raise HTTPException(400, "That file is not a zip")
+        ex = work / "x"; ex.mkdir()
+        with zipfile.ZipFile(zpath) as zf:
+            for m in zf.infolist():                       # refuse paths that would escape the folder
+                target = (ex / m.filename).resolve()
+                if ex.resolve() not in target.parents and target != ex.resolve():
+                    raise HTTPException(400, "The zip contains an unsafe path")
+            await asyncio.to_thread(zf.extractall, str(ex))
+        meta_files = sorted(ex.rglob("job_meta.json"), key=lambda p: len(p.parts))
+        if not meta_files: raise HTTPException(400, "No job_meta.json inside — this is not an AI Dub Studio job zip")
+        src = meta_files[0].parent
+        meta = load_json_file(meta_files[0])
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", str(meta.get("job_id") or src.name or "imported_job")) or "imported_job"
+        job_id, n = base, 1
+        while (JOBS_DIR / job_id).exists():               # never overwrite a job that already exists here
+            n += 1; job_id = f"{base}_imported{'' if n == 2 else n}"
+        shutil.move(str(src), str(JOBS_DIR / job_id))
+        jd = JOBS_DIR / job_id
+        jp.normalize_imported_job(jd)
+        meta = load_json_file(jd / "job_meta.json"); meta["job_id"] = job_id; save_json_file(jd / "job_meta.json", meta)
+        mp = jd / "manifest.json"
+        if mp.exists():
+            m = load_json_file(mp); m["job_id"] = job_id; save_json_file(mp, m)
+        _MIGRATED.add(job_id)
+        return {"ok": True, "job_id": job_id}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+# The editor's player shows the REAL assembled result once an export exists — until the
+# dialogues/dubs are edited again (then the export is out of date and the preview takes over).
+@app.get("/api/jobs/{job_id}/assembled_status")
+def assembled_status(job_id: str):
+    jd = get_job_dir(job_id)
+    pv = jd / "assembled_preview.mp4"
+    if not pv.exists() or _final_output(job_id) is None:
+        return {"available": False, "stale": False, "version": 0}
+    t = pv.stat().st_mtime
+    watched = [jd / "01_transcription.json", jd / "03_translations.json", jd / "04_tts" / "tts_manifest.json", jd / "mix.json"]
+    stale = any(p.exists() and p.stat().st_mtime > t + 1.0 for p in watched)
+    return {"available": True, "stale": stale, "version": int(t)}
+
+@app.get("/api/jobs/{job_id}/assembled_video")
+def assembled_video(job_id: str):
+    pv = get_job_dir(job_id) / "assembled_preview.mp4"
+    if not pv.exists(): raise HTTPException(404)
+    return FileResponse(str(pv), media_type="video/mp4")
 
 # ---------------------------------------------------------------------------
 # Audio / Video serving
+# Browsers only play a few codec/container combinations (H.264 in mp4 is the safe one).
+# Anything else — webm variants, mkv, avi, wmv, flv, HEVC, mpeg-ts, … — is converted ONCE into
+# a lightweight H.264/AAC preview (jobs/<id>/preview.mp4). It is only for the editor's player:
+# the dubbing stages and the export always use the original file.
+_PREVIEW_STATE: Dict[str, dict] = {}     # job_id -> {"state": "processing"|"failed", "error": str}
+
+def _input_video_path(job_id: str) -> Path:
+    jd = get_job_dir(job_id)
+    if not (jd / "job_meta.json").exists(): raise HTTPException(404)
+    vp = jp.find_source_video(jd)
+    if vp is None: raise HTTPException(404, "Original video file is missing (expected in the job's source/ folder)")
+    return vp
+
+def _probe_streams(vp: Path) -> dict:
+    """{"v": codec|None, "a": codec|None, "pix": str, "fmt": str} via ffprobe ({} if unavailable)."""
+    if not shutil.which("ffprobe"): return {}
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt:format=format_name",
+                            "-of", "json", str(vp)], capture_output=True, text=True, timeout=60)
+        j = json.loads(r.stdout or "{}")
+    except Exception:
+        return {}
+    out = {"v": None, "a": None, "pix": "", "fmt": (j.get("format") or {}).get("format_name", "")}
+    for s in j.get("streams", []):
+        if s.get("codec_type") == "video" and out["v"] is None: out["v"], out["pix"] = s.get("codec_name"), s.get("pix_fmt", "")
+        if s.get("codec_type") == "audio" and out["a"] is None: out["a"] = s.get("codec_name")
+    return out
+
+def _browser_can_play_directly(vp: Path) -> bool:
+    if vp.suffix.lower() not in (".mp4", ".m4v", ".mov"): return False
+    p = _probe_streams(vp)
+    return bool(p) and p["v"] == "h264" and p["pix"] in ("yuv420p", "yuvj420p", "") and p["a"] in (None, "aac", "mp3")
+
+def _preview_path(job_id: str) -> Path: return get_job_dir(job_id) / "preview.mp4"
+
+def _make_preview(job_id: str, vp: Path) -> None:
+    out = _preview_path(job_id); tmp = out.with_suffix(".part.mp4")
+    cmd = ["ffmpeg", "-y", "-i", str(vp), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+           "-vf", "scale=-2:'min(720,ih)',format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart", str(tmp)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists():
+            tail = (r.stderr or "").strip().splitlines()[-1:] or ["ffmpeg failed"]
+            _PREVIEW_STATE[job_id] = {"state": "failed", "error": tail[0][:200]}
+            tmp.unlink(missing_ok=True); return
+        tmp.replace(out)
+        _PREVIEW_STATE.pop(job_id, None)
+    except Exception as e:
+        _PREVIEW_STATE[job_id] = {"state": "failed", "error": str(e)[:200]}
+
+@app.get("/api/jobs/{job_id}/video_status")
+async def video_status(job_id: str):
+    """state: ready (play /video) | processing (converting, poll again) | failed."""
+    vp = _input_video_path(job_id)
+    if _preview_path(job_id).exists() or await asyncio.to_thread(_browser_can_play_directly, vp):
+        return {"state": "ready"}
+    st = _PREVIEW_STATE.get(job_id)
+    if st and st["state"] == "processing": return {"state": "processing"}
+    if st and st["state"] == "failed":     return {"state": "failed", "error": st.get("error", "")}
+    if not shutil.which("ffmpeg"):
+        return {"state": "failed", "error": "ffmpeg was not found, so this video can't be converted for preview"}
+    _PREVIEW_STATE[job_id] = {"state": "processing"}
+    asyncio.get_running_loop().run_in_executor(None, _make_preview, job_id, vp)
+    return {"state": "processing"}
+
+@app.post("/api/jobs/{job_id}/video_status/retry")
+async def video_retry(job_id: str):
+    _PREVIEW_STATE.pop(job_id, None); _preview_path(job_id).unlink(missing_ok=True)
+    return await video_status(job_id)
+
 @app.get("/api/jobs/{job_id}/video")
 def serve_video(job_id: str):
-    mp = get_job_dir(job_id) / "job_meta.json"
-    if not mp.exists(): raise HTTPException(404)
-    meta = load_json_file(mp)
-    vp   = Path(meta.get("input_video",""))
-    if not vp.exists(): raise HTTPException(404)
-    return FileResponse(str(vp), media_type="video/mp4")
+    vp = _input_video_path(job_id)
+    pv = _preview_path(job_id)
+    if pv.exists(): return FileResponse(str(pv), media_type="video/mp4")
+    if _browser_can_play_directly(vp): return FileResponse(str(vp), media_type="video/mp4")
+    raise HTTPException(409, "Preview is still being prepared")
 
 @app.get("/api/jobs/{job_id}/tts_audio/{dialogue_id}")
 def serve_tts(job_id: str, dialogue_id: str):
@@ -968,14 +1447,8 @@ def serve_audio_track(job_id: str, track: str):
     """Serve a full mixdown-stage audio track. track: no_vocals | vocals | original.
     Used by the frontend's dub-preview toggle to play a background layer
     while TTS clips are triggered on top, without waiting for Stage 05."""
-    fname_map = {
-        "no_vocals": f"{job_id}_no_vocals.wav",
-        "vocals":    f"{job_id}_vocals.wav",
-        "original":  f"{job_id}.wav",
-    }
-    fname = fname_map.get(track)
-    if not fname: raise HTTPException(404, "Unknown track")
-    p = AUDIO_DIR / fname
+    if track not in ("no_vocals", "vocals", "original"): raise HTTPException(404, "Unknown track")
+    p = job_audio(job_id, track)
     if not p.exists(): raise HTTPException(404)
     return FileResponse(str(p), media_type="audio/wav")
 
@@ -987,7 +1460,7 @@ def serve_vocals_clip(job_id: str, dialogue_id: str):
     data = load_json_file(p)
     dlg  = next((d for d in data.get("dialogues",[]) if d["id"]==dialogue_id), None)
     if not dlg: raise HTTPException(404)
-    vp = AUDIO_DIR / f"{job_id}_vocals.wav"
+    vp = job_audio(job_id, "vocals")
     if not vp.exists(): raise HTTPException(404)
     try:
         with wave_mod.open(str(vp), 'rb') as wf:

@@ -11,6 +11,23 @@ export const SPEAKER_COLORS = [
   '#607D8B','#795548','#FF4081','#69F0AE',
 ]
 
+// Which JSON file(s) a field lives in — mirrors the server's routing so the local
+// copy never gains fields the file doesn't have (undo/redo writes these arrays back).
+const TRANSLATIONS_ONLY = new Set([
+  'translation', 'is_passthrough', 'manual_ref_audio', 'source_lang', 'target_lang',
+  'dub_speed', 'dub_start_ms', 'dub_trim_start_ms', 'dub_trim_end_ms', 'dub_deleted', 'dub_parts', 'dub_volume',
+])
+const TRANSCRIPTION_ONLY = new Set(['text', 'is_nonlexical', 'words'])
+const pickFor = (fields, file) => {
+  const out = {}
+  Object.keys(fields).forEach(k => {
+    if (file === 'transcription' && TRANSLATIONS_ONLY.has(k)) return
+    if (file === 'translations' && TRANSCRIPTION_ONLY.has(k)) return
+    out[k] = fields[k]
+  })
+  return out
+}
+
 const WS_RECONNECT_BASE_MS = 1000
 const WS_RECONNECT_MAX_MS  = 15000
 
@@ -32,6 +49,12 @@ export const useStore = create((set, get) => ({
   // default each session (original language first); only the chosen target
   // script is remembered. translitVersion bumps when a lazily-loaded engine
   // finishes loading so already-rendered text redraws.
+  asrModel: 'medium',   // Whisper model for the job's speech-recognition stage (all dialogues). medium = recommended, large-v3 = optional
+  mix: { no_vocals: 1, vocals: 1, dub: 1 },   // Mixer: level of each layer (preview AND export)
+  assembled: { available: false, stale: false, version: 0 }, // is there a real exported video, and is it still up to date?
+  shortWarning: null,        // { count } — reminder popup after speaker detection
+  timelineMode: 'original', // 'original' | 'dubbed' — which bars the Timeline shows (independent of the video's Original/Dubbed)
+  ttsEpoch: 0, ttsVersion: {}, // bumped when a dub is re-synthesized → waveform/audio caches refresh
   dubbedView: false,     // Original / Dubbed audio choice (shared so the timeline's click-preview follows it)
   videoPlaying: false,   // true while the video is playing — the timeline skips its click-preview then (it would double up with the mix)
   translitOn: false,
@@ -41,6 +64,51 @@ export const useStore = create((set, get) => ({
   asrRerunStatus: {},
   ws: null, wsReconnectAttempt: 0, wsReconnectTimer: null,
 
+  loadAsrModel: async (jobId) => {
+    const id = jobId || get().currentJobId
+    if (!id) return
+    const m = await axios.get(`${API}/jobs/${id}/asr_model`).then(r => r.data.model).catch(() => null)
+    if (m && get().currentJobId === id) set({ asrModel: m })
+  },
+  // GLOBAL: the model the whole speech-recognition stage uses next time it runs (all dialogues)
+  setAsrModel: async (model) => {
+    const id = get().currentJobId
+    if (!id) return
+    set({ asrModel: model })
+    await axios.post(`${API}/jobs/${id}/asr_model`, { model }).catch(() => get().loadAsrModel(id))
+  },
+  loadMix: async (jobId) => {
+    const id = jobId || get().currentJobId
+    if (!id) return
+    const m = await axios.get(`${API}/jobs/${id}/mix`).then(r => r.data).catch(() => null)
+    if (m && get().currentJobId === id) set({ mix: m })
+  },
+  // layer: 'no_vocals' | 'vocals' | 'dub'. Shown at once, saved shortly after you stop moving the slider.
+  setMixLayer: (layer, value) => {
+    const v = Math.max(0, Math.min(4, Number(value) || 0))
+    set(s => ({ mix: { ...s.mix, [layer]: v } }))
+    clearTimeout(get()._mixTimer)
+    const id = get().currentJobId
+    const t = setTimeout(() => {
+      axios.post(`${API}/jobs/${id}/mix`, { [layer]: v }).then(() => get().fetchAssembled(id)).catch(() => {})
+    }, 350)
+    set({ _mixTimer: t })
+  },
+  fetchAssembled: async (jobId) => {
+    const id = jobId || get().currentJobId
+    if (!id) return
+    const a = await axios.get(`${API}/jobs/${id}/assembled_status`).then(r => r.data).catch(() => null)
+    if (a && get().currentJobId === id) set({ assembled: a })
+  },
+  // After speaker detection: remind about dialogues under 1 s (they get a repeated ref, but a good ref is better)
+  checkShortDialogues: () => {
+    const n = (get().transcription?.dialogues || []).filter(d => (d.end_ms - d.start_ms) < 1000).length
+    set({ shortWarning: n > 0 ? { count: n } : null })
+  },
+  dismissShortWarning: () => set({ shortWarning: null }),
+
+  setTimelineMode: (m) => set({ timelineMode: m === 'dubbed' ? 'dubbed' : 'original' }),
+
   loadJobs: async () => {
     const { data } = await axios.get(`${API}/jobs`)
     set({ jobs: data })
@@ -49,13 +117,15 @@ export const useStore = create((set, get) => ({
   selectJob: async (jobId) => {
     const { wsReconnectTimer } = get()
     if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
-    set({ currentJobId: jobId, logs: [], selectedDialogueId: null,
+    set({ currentJobId: jobId, logs: [], selectedDialogueId: null, timelineMode: 'original', mix: { no_vocals: 1, vocals: 1, dub: 1 }, asrModel: 'medium', assembled: { available: false, stale: false, version: 0 }, shortWarning: null,
           transcription: null, translations: null, ttsManifest: null,
           pipelineRunning: false, pipelinePaused: false, pausedCheckpoint: null, readyForExport: false,
           undoStack: [], redoStack: [],
           wsReconnectAttempt: 0 })
     get().connectWS(jobId)
     await get().refreshAll(jobId)
+    get().loadMix(jobId)
+    get().loadAsrModel(jobId)
   },
 
   refreshAll: async (jobId) => {
@@ -72,6 +142,7 @@ export const useStore = create((set, get) => ({
     set({ jobMeta: meta, manifest, speakers, speakerColors: colors, speakerProfiles: profiles })
     if (meta?.source_lang) set({ sourceLang: meta.source_lang })
     if (meta?.target_lang) set({ targetLang: meta.target_lang })
+    get().fetchAssembled(id)
     const stages = manifest?.stages || {}
     const updates = {}
     if (stages['01_asr']?.status === 'completed') {
@@ -123,9 +194,16 @@ export const useStore = create((set, get) => ({
     switch (msg.type) {
       case 'log':
         set(s => ({ logs: [...s.logs.slice(-800), msg] })); break
+      case 'stages_reset':          // a stage is being re-run → it and the later ones are pending again
+        refreshAll(currentJobId); break
       case 'stage_started':
         set({ pipelineRunning: true, pipelineStage: msg.stage, readyForExport: false, waitingOnTranslation: false }); break
       case 'stage_completed':
+        if (msg.stage === '04_tts') set(s => ({ ttsEpoch: s.ttsEpoch + 1 }))
+        Promise.resolve(refreshAll(currentJobId)).then(() => {
+          if (msg.stage === '01b_diarization') get().checkShortDialogues()
+        })
+        break
       case 'stage_failed':
       case 'stage_skipped':
         refreshAll(currentJobId); break
@@ -180,7 +258,8 @@ export const useStore = create((set, get) => ({
       case 'tts_rerun_started':
         set(s => ({ ttsRerunStatus: { ...s.ttsRerunStatus, [msg.dialogue_id]: 'running' } })); break
       case 'tts_rerun_complete':
-        set(s => ({ ttsRerunStatus: { ...s.ttsRerunStatus, [msg.dialogue_id]: 'done' } }))
+        set(s => ({ ttsRerunStatus: { ...s.ttsRerunStatus, [msg.dialogue_id]: 'done' },
+                    ttsVersion: { ...s.ttsVersion, [msg.dialogue_id]: (s.ttsVersion[msg.dialogue_id] || 0) + 1 } }))
         refreshAll(currentJobId); break
       case 'tts_rerun_failed':
         set(s => ({ ttsRerunStatus: { ...s.ttsRerunStatus, [msg.dialogue_id]: 'failed' } })); break
@@ -224,7 +303,9 @@ export const useStore = create((set, get) => ({
     set({ pipelineRunning: true })
   },
 
-  selectDialogue: (id) => set({ selectedDialogueId: id }),
+  selectedPartId: 'p0',   // which piece of a split dub the Dubbed view is editing
+  selectDialogue: (id, partId = 'p0') => set({ selectedDialogueId: id, selectedPartId: partId }),
+  selectDub: (id, partId = 'p0') => set({ selectedDialogueId: id, selectedPartId: partId }),
   setPlayheadMs:  (ms) => set({ playheadMs: ms }),
   setZoom: (z) => set({ timelineZoom: Math.max(15, Math.min(600, z)) }),
   setAutoSave: (v) => set({ autoSaveEnabled: v }),
@@ -271,12 +352,12 @@ export const useStore = create((set, get) => ({
   updateDialogue: async (dialogueId, field, value) => {
     const { currentJobId, transcription, translations } = get()
     get()._snapshot()
-    if (transcription) {
+    if (transcription && !TRANSLATIONS_ONLY.has(field)) {
       const t = JSON.parse(JSON.stringify(transcription))
       t.dialogues?.forEach(d => { if (d.id === dialogueId) d[field] = value })
       set({ transcription: t })
     }
-    if (translations) {
+    if (translations && !TRANSCRIPTION_ONLY.has(field)) {
       const t = JSON.parse(JSON.stringify(translations))
       t.dialogues?.forEach(d => { if (d.id === dialogueId) d[field] = value })
       set({ translations: t })
@@ -287,13 +368,14 @@ export const useStore = create((set, get) => ({
   updateDialogueFields: async (dialogueId, fields) => {
     const { currentJobId, transcription, translations } = get()
     get()._snapshot()
-    const apply = (obj) => {
+    const apply = (obj, file) => {
       if (!obj) return obj
       const t = JSON.parse(JSON.stringify(obj))
-      t.dialogues?.forEach(d => { if (d.id === dialogueId) Object.assign(d, fields) })
+      const f = pickFor(fields, file)
+      t.dialogues?.forEach(d => { if (d.id === dialogueId) Object.assign(d, f) })
       return t
     }
-    set({ transcription: apply(transcription), translations: apply(translations) })
+    set({ transcription: apply(transcription, 'transcription'), translations: apply(translations, 'translations') })
     await axios.post(`${API}/jobs/${currentJobId}/dialogue/update_many`, { dialogue_id: dialogueId, fields })
   },
 
@@ -367,9 +449,10 @@ export const useStore = create((set, get) => ({
     await axios.post(`${API}/jobs/${currentJobId}/tts/rerun`, { dialogue_id: dialogueId })
   },
 
-  rerunASR: async (dialogueId) => {
+  // INDIVIDUAL: re-transcribe one dialogue with the model chosen for it (independent of the job's model)
+  rerunASR: async (dialogueId, model) => {
     const { currentJobId } = get()
-    await axios.post(`${API}/jobs/${currentJobId}/asr/rerun`, { dialogue_id: dialogueId })
+    await axios.post(`${API}/jobs/${currentJobId}/asr/rerun`, { dialogue_id: dialogueId, model })
   },
 
   toggleOverlay: (name) => set(s => ({ activeOverlay: s.activeOverlay === name ? null : name })),
@@ -393,6 +476,7 @@ export const useStore = create((set, get) => ({
       transcription_dialogues: prev.transcription?.dialogues ?? null,
       translations_dialogues:  prev.translations?.dialogues  ?? null,
     }).catch(() => {})
+    get().fetchAssembled()
   },
 
   redo: async () => {
@@ -405,6 +489,7 @@ export const useStore = create((set, get) => ({
       transcription_dialogues: next.transcription?.dialogues ?? null,
       translations_dialogues:  next.translations?.dialogues  ?? null,
     }).catch(() => {})
+    get().fetchAssembled()
   },
 }))
 

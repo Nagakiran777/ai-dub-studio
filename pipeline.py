@@ -14,6 +14,11 @@ from pathlib import Path
 
 import yaml
 
+# every job keeps ALL its files inside jobs/<job_id>/ (see stages/_shared/jobpaths.py)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "stages" / "_shared"))
+import jobpaths as jp
+
 
 # ============================================================
 # CONFIG LOADER
@@ -34,11 +39,19 @@ def create_job(input_video: str, config: dict) -> str:
 
     job_dir = Path(config["paths"]["jobs"]) / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    jp.ensure_layout(job_dir)
+
+    # the video is copied INTO the job (source/), so the job folder is self-contained
+    src_video = Path(input_video).resolve()
+    dest_video = jp.source_dir(job_dir) / src_video.name
+    if not dest_video.exists():
+        print(f"[pipeline] Copying video into the job folder: {dest_video}")
+        shutil.copy2(src_video, dest_video)
 
     job_meta = {
         "job_id":      job_id,
-        "input_video": str(Path(input_video).resolve()),
-        "input_file":  str(Path(input_video).resolve()),
+        "input_video": f"{jp.SOURCE_DIR}/{dest_video.name}",    # relative → the job can be zipped and moved
+        "input_file":  f"{jp.SOURCE_DIR}/{dest_video.name}",
         "video_name":  video_name,
         "created_at":  datetime.now().isoformat(),
         "source_lang": config["language"]["source"],
@@ -185,6 +198,7 @@ def run_pipeline(input_video: str, job_id: str = None,
         job_id = create_job(input_video, config)
     else:
         print(f"[pipeline] Resuming job: {job_id}")
+        jp.migrate_legacy_job(".", config["paths"]["jobs"], job_id)
 
     manifest       = load_manifest(job_id, config)
     stages_to_run  = config["pipeline"]["run_stages"]
@@ -194,6 +208,20 @@ def run_pipeline(input_video: str, job_id: str = None,
     print(f"[pipeline] Input      : {input_video}")
     print(f"[pipeline] Stages     : {stages_to_run}")
     print(f"[pipeline] {'='*50}\n")
+
+    # Forcing a stage to re-run: stage scripts are restart-safe (they exit at once when the manifest
+    # says "completed"), so flip that stage AND every later one back to pending first.
+    if force_stage and force_stage in stages_to_run:
+        for st in stages_to_run[stages_to_run.index(force_stage):]:
+            manifest["stages"].setdefault(st, {})
+            manifest["stages"][st].update({"status": "pending", "completed_at": None, "failed_at": None})
+        save_manifest(job_id, manifest, config)
+        print(f"[pipeline] Re-running from {force_stage}: it and the later stages are pending again")
+        if force_stage == "00_vocals":
+            jd = Path(config["paths"]["jobs"]) / job_id
+            for f in (jp.vocals_wav(jd), jp.no_vocals_wav(jd), jd / "00_vocals_progress.json"):
+                f.unlink(missing_ok=True)
+            shutil.rmtree(jd / "00_vocals_chunks", ignore_errors=True)
 
     # Run each stage
     for stage in stages_to_run:

@@ -10,6 +10,11 @@ project:
 # PATHS
 # ============================================================
 paths:
+  # Every job keeps ALL its files inside jobs/<job_id>/ :
+  #   source/ (video)  audio/ (original, vocals, no_vocals)  output/ (exported video)  logs/  + stage data
+  # so a job can be zipped ("Zip this job") and imported into any AI Dub Studio.
+  # The three data_* folders below are the OLD layout — only read when an old job is moved
+  # into its own folder automatically; nothing new is written there.
   data_input:   "data/input"
   data_audio:   "data/audio"
   data_output:  "data/outputs"
@@ -57,7 +62,9 @@ stages:
   # ----------------------------------------------------------
   asr:
     env_name:                     "dub_asr"
-    model:                        "large-v3"
+    # Whisper model: "medium" (recommended default) or "large-v3". The UI choice per job
+    # (Select ASR model in the pipeline panel) overrides this; this is only the fallback.
+    model:                        "medium"
     device:                       "cuda"
     language:                     "en"
     temperature:                  0.0
@@ -65,6 +72,12 @@ stages:
     no_speech_threshold:          0.6
     condition_on_previous_text:   false
     compression_ratio_threshold:  2.4
+    # Engine for the experiment: "openai-whisper" (default, unchanged) or "faster-whisper".
+    # faster-whisper = same large-v3, same settings above, same single whole-file pass,
+    # no VAD, greedy decoding (beam 1) — only the engine differs. Needs: pip install faster-whisper (in dub_asr)
+    backend:                      "faster-whisper"
+    faster_whisper_compute_type:  "float16"   # if 4 GB VRAM runs out: "int8_float16"
+    faster_whisper_beam_size:     1           # 1 = same greedy decoding as openai-whisper
 
   # ----------------------------------------------------------
   # STAGE 01b — Speaker Diarization
@@ -72,7 +85,7 @@ stages:
   diarization:
     env_name:               "dub_diar"
     device:                 "cuda"
-    max_num_speakers:       50
+    max_num_speakers:       100
     distance_threshold:     0.60
     speaker_profile_min_s:  3.0
     speaker_profile_max_s:  10000.0
@@ -104,15 +117,42 @@ stages:
     sample_rate:        24000
     min_ref_duration_s: 1.0
 
+    # --- OmniVoice generation settings (passed to model.generate for every dialogue) ---------
+    # The values below are OmniVoice's own defaults, so nothing changes until you edit them.
+    # Delete a line (or leave it empty) to stop passing it. The LANGUAGE is not set here: it is
+    # the job's target language (or a dialogue's own target language set in the editor).
+    #
+    # num_step: how many refinement passes. Higher = better/more complete speech, slower.
+    #           16 = fast, 32 = default, 48-64 = try these if words get skipped.
+    num_step: 64
+    # position_temperature: randomness in choosing which part of the audio to fill next.
+    #           0 = always the same choice (steady), 5.0 = default (most random).
+    #           Try 0-2 if the voice is unstable or words are dropped.
+    position_temperature: 5.0
+
   # ----------------------------------------------------------
   # STAGE 05 — Assembly
   # Background: {job_id}_no_vocals.wav (BS-Roformer BGM+SFX)
   # ----------------------------------------------------------
   assembly:
     env_name:               "dub_assembly"
-    sample_rate:            24000
+    # The export mix is built at this rate. 44100 matches the original audio tracks, so the
+    # exported video sounds like the preview (24000 cuts everything above 12 kHz). RAM:
+    # roughly 4 arrays x duration x rate x 4 bytes (a 2-hour film ≈ 5 GB at 44100) — use 32000 or
+    # 24000 for very long videos.
+    sample_rate:            44100
     timestamp_tolerance_ms: 80
     fade_ms:                10
+    # NO automatic loudness normalization: every dub plays at its natural level x the volume you
+    # set (per dialogue, and the Mixer layers) — exactly what the preview plays.
+    match_dialogue_volume:  false  # true = bring back the old automatic "as loud as the original line"
+    volume_gain_min:        0.1
+    volume_gain_max:        8.0
+    # How a sped-up / slowed-down dub is time-stretched (pitch preserved):
+    #   atempo      — closest to the browser preview (default)
+    #   rubberband  — often the cleanest, needs ffmpeg built with librubberband
+    #   librosa     — the old phase vocoder (robotic on speech; fallback only)
+    speed_method:           "atempo"
     nonlexical_sounds:
       - "hmm"
       - "uh"

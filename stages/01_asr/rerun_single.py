@@ -32,6 +32,9 @@ import torchaudio
 import soundfile as sf
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
+import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
+
 STAGE_NAME = "01_asr_rerun"
 
 
@@ -40,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--job_id",      required=True)
     p.add_argument("--dialogue_id", required=True)
     p.add_argument("--config",      required=True)
+    p.add_argument("--model",       required=False, default=None,
+                   help="Whisper model for THIS dialogue only: 'medium' or 'large-v3' "
+                        "(independent of the job's model; overrides stages.asr.model)")
     return p.parse_args()
 
 
@@ -87,9 +93,11 @@ def main() -> None:
     project_root = Path(args.config).parent.resolve()
     os.chdir(project_root)
 
-    logs_dir  = config["paths"]["logs"]
     jobs_dir  = config["paths"]["jobs"]
-    audio_dir = project_root / config["paths"]["data_audio"]
+    jp.migrate_legacy_job(project_root, jobs_dir, args.job_id)
+    job_dir_  = jp.job_dir(project_root, jobs_dir, args.job_id)
+    logs_dir  = str(jp.logs_dir(job_dir_))
+    audio_dir = jp.audio_dir(job_dir_)
     logger = setup_logging(args.job_id, logs_dir)
 
     logger.info("=" * 60)
@@ -113,7 +121,7 @@ def main() -> None:
         logger.error(f"[{args.dialogue_id}] Invalid range {start_ms}-{end_ms}ms")
         sys.exit(1)
 
-    vocals_path = audio_dir / f"{args.job_id}_vocals.wav"
+    vocals_path = jp.vocals_wav(job_dir_)
     if not vocals_path.exists():
         logger.error(f"_vocals.wav not found at {vocals_path}")
         sys.exit(1)
@@ -141,34 +149,64 @@ def main() -> None:
 
     asr_cfg = config["stages"]["asr"]
     device  = asr_cfg.get("device", "cuda")
-    model_name = asr_cfg.get("model", "large-v3")
+    # a model picked for THIS dialogue wins; otherwise config.yaml (the job's global model is only
+    # used by the full ASR stage — the two choices are independent)
+    model_name = (args.model or asr_cfg.get("model", "medium")).strip()
+    logger.info(f"[{args.dialogue_id}] Re-transcribing with Whisper model: {model_name}"
+                f"{' (chosen for this dialogue)' if args.model else ' (from config.yaml)'}")
     model_cache = Path(config["paths"]["models_cache"]); model_cache.mkdir(parents=True, exist_ok=True)
 
-    import whisper
-    logger.info(f"Loading Whisper '{model_name}' | device={device} | language={language or 'auto-detect'}")
-    model = whisper.load_model(model_name, device=device, download_root=str(model_cache), in_memory=True)
+    if str(asr_cfg.get("backend", "openai-whisper")).strip().lower() in ("faster-whisper", "faster_whisper", "fasterwhisper"):
+        # Same backend as the main stage, so a re-transcribe matches the full run.
+        from faster_whisper import WhisperModel
+        compute = asr_cfg.get("faster_whisper_compute_type", "float16" if device == "cuda" else "int8")
+        logger.info(f"Loading faster-whisper '{model_name}' | device={device} | compute_type={compute} | language={language or 'auto-detect'}")
+        fw_model = WhisperModel(model_name, device=device, compute_type=compute, download_root=str(model_cache))
+        try:
+            seg_iter, _info = fw_model.transcribe(
+                tmp.name,
+                language=language,
+                word_timestamps=False,
+                temperature=asr_cfg.get("temperature", 0.0),
+                log_prob_threshold=asr_cfg.get("logprob_threshold", -1.0),
+                no_speech_threshold=asr_cfg.get("no_speech_threshold", 0.6),
+                condition_on_previous_text=asr_cfg.get("condition_on_previous_text", False),
+                compression_ratio_threshold=asr_cfg.get("compression_ratio_threshold", 2.4),
+                beam_size=int(asr_cfg.get("faster_whisper_beam_size", 1)),
+                vad_filter=False,
+            )
+            new_text = " ".join(seg.text.strip() for seg in seg_iter).strip()
+        finally:
+            del fw_model
+            release_gpu(logger)
+            try: os.unlink(tmp.name)
+            except Exception: pass
+    else:
+        import whisper
+        logger.info(f"Loading Whisper '{model_name}' | device={device} | language={language or 'auto-detect'}")
+        model = whisper.load_model(model_name, device=device, download_root=str(model_cache), in_memory=True)
 
-    try:
-        result = model.transcribe(
-            tmp.name,
-            language=language,
-            word_timestamps=False,
-            verbose=False,
-            fp16=(device == "cuda"),
-            temperature=asr_cfg.get("temperature", 0.0),
-            logprob_threshold=asr_cfg.get("logprob_threshold", -1.0),
-            no_speech_threshold=asr_cfg.get("no_speech_threshold", 0.6),
-            condition_on_previous_text=asr_cfg.get("condition_on_previous_text", False),
-            compression_ratio_threshold=asr_cfg.get("compression_ratio_threshold", 2.4),
-        )
-        new_text = " ".join(seg["text"].strip() for seg in result.get("segments", [])).strip()
-        if not new_text:
-            new_text = (result.get("text") or "").strip()
-    finally:
-        del model
-        release_gpu(logger)
-        try: os.unlink(tmp.name)
-        except Exception: pass
+        try:
+            result = model.transcribe(
+                tmp.name,
+                language=language,
+                word_timestamps=False,
+                verbose=False,
+                fp16=(device == "cuda"),
+                temperature=asr_cfg.get("temperature", 0.0),
+                logprob_threshold=asr_cfg.get("logprob_threshold", -1.0),
+                no_speech_threshold=asr_cfg.get("no_speech_threshold", 0.6),
+                condition_on_previous_text=asr_cfg.get("condition_on_previous_text", False),
+                compression_ratio_threshold=asr_cfg.get("compression_ratio_threshold", 2.4),
+            )
+            new_text = " ".join(seg["text"].strip() for seg in result.get("segments", [])).strip()
+            if not new_text:
+                new_text = (result.get("text") or "").strip()
+        finally:
+            del model
+            release_gpu(logger)
+            try: os.unlink(tmp.name)
+            except Exception: pass
 
     if not new_text:
         logger.error(f"[{args.dialogue_id}] Whisper returned empty text for this slice")
@@ -177,6 +215,7 @@ def main() -> None:
     logger.info(f"[{args.dialogue_id}] New text: {new_text!r}")
 
     dialogue["text"] = new_text
+    dialogue["asr_model"] = model_name        # remember which model produced this line's text
     with open(trans_path, "w", encoding="utf-8") as f:
         json.dump(transcription, f, indent=2, ensure_ascii=False)
 

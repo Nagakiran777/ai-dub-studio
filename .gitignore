@@ -30,3 +30,14 @@ Thumbs.db
 
 # Environment files and secrets
 .env*
+
+dubstudio_update.zip
+stages/05_assembly/run1.py
+# Entire local data directory
+/data/
+
+# All temporary archives
+*.zip
+
+# AI-generated temporary code dumps
+gemini-code-*.txt

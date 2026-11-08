@@ -44,6 +44,9 @@ import numpy as np
 import soundfile as sf
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
+import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -150,7 +153,8 @@ def load_config(config_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def setup_logging(job_id: str, config: dict[str, Any]) -> logging.Logger:
-    logs_dir = Path(config["paths"]["logs"])
+    jp.migrate_legacy_job(".", config["paths"]["jobs"], job_id)
+    logs_dir = jp.logs_dir(Path(config["paths"]["jobs"]) / job_id)
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{job_id}_{STAGE_NAME}.log"
     fmt      = "%(asctime)s [%(levelname)s] %(message)s"
@@ -305,9 +309,9 @@ def _is_valid_wav(wav_path: Path, logger: logging.Logger) -> bool:
 # ---------------------------------------------------------------------------
 
 def extract_full_audio(job_id, config, manifest, logger) -> Path:
-    audio_dir = Path(config["paths"]["data_audio"])
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    wav_path  = audio_dir / f"{job_id}.wav"
+    job_dir   = Path(config["paths"]["jobs"]) / job_id
+    jp.ensure_layout(job_dir)
+    wav_path  = jp.original_wav(job_dir)
 
     if _is_valid_wav(wav_path, logger):
         logger.info(f"Full audio already exists -> {wav_path} (skipping)")
@@ -316,22 +320,17 @@ def extract_full_audio(job_id, config, manifest, logger) -> Path:
     if wav_path.exists():
         wav_path.unlink()
 
-    job_dir       = Path(config["paths"]["jobs"]) / job_id
     job_meta_path = job_dir / "job_meta.json"
-    input_video   = None
-
+    job_meta = {}
     if job_meta_path.exists():
         with job_meta_path.open("r", encoding="utf-8") as f:
             job_meta = json.load(f)
-        input_video = job_meta.get("input_video") or job_meta.get("input_file")
 
-    if not input_video:
-        input_video = manifest.get("input_video") or manifest.get("input_file")
-
-    if not input_video:
-        raise ValueError("Cannot determine input_video from job_meta.json or manifest")
-    if not Path(input_video).exists():
-        raise FileNotFoundError(f"Input video not found: {input_video}")
+    # the video lives in jobs/<job_id>/source/ (older jobs: the path stored in job_meta.json)
+    found = jp.find_source_video(job_dir, job_meta)
+    if found is None:
+        raise FileNotFoundError(f"No input video found in {jp.source_dir(job_dir)}")
+    input_video = str(found)
 
     logger.info(f"Input video: {input_video}")
 
@@ -549,9 +548,10 @@ def _apply_crossfade_and_add(
 
 def separate_vocals(job_id, full_wav, config, logger) -> tuple[Path, Path]:
     """BS-Roformer separation — produces vocals.wav + no_vocals.wav (44100Hz stereo)."""
-    audio_dir      = Path(config["paths"]["data_audio"])
-    vocals_path    = audio_dir / f"{job_id}_vocals.wav"
-    no_vocals_path = audio_dir / f"{job_id}_no_vocals.wav"
+    job_dir        = Path(config["paths"]["jobs"]) / job_id
+    jp.ensure_layout(job_dir)
+    vocals_path    = jp.vocals_wav(job_dir)
+    no_vocals_path = jp.no_vocals_wav(job_dir)
 
     if _is_valid_wav(vocals_path, logger) and _is_valid_wav(no_vocals_path, logger):
         logger.info("Both output files already exist — skipping separation")

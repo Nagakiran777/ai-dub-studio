@@ -8,6 +8,7 @@ import DialogueEditor from './components/DialogueEditor'
 import LogPanel from './components/LogPanel'
 import SpeakerPanel from './components/SpeakerPanel'
 import TranslationPanel from './components/TranslationPanel'
+import ShortDialogueNotice from './components/ShortDialogueNotice'
 
 export default function App() {
   const { loadJobs, activeOverlay, closeOverlay } = useStore()
@@ -56,6 +57,7 @@ export default function App() {
   return (
     <div ref={containerRef} style={{ display:'flex', flexDirection:'column', height:'100vh', width:'100vw', overflow:'hidden', background:'#080808' }}>
       <TopBar />
+      <ShortDialogueNotice />
       <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
         {/* Left */}
         <div style={{ display:'flex', flexDirection:'column', flex:1, overflow:'hidden', minWidth:0 }}>

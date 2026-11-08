@@ -34,6 +34,9 @@ import soundfile as sf
 import torch
 import torchaudio
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
+import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.preprocessing import normalize
 
@@ -369,8 +372,9 @@ def run_diarization(job_id: str, config_path: str) -> None:
 
     jobs_dir           = project_root / cfg["paths"]["jobs"]
     job_dir            = jobs_dir / job_id
-    logs_dir           = project_root / cfg["paths"]["logs"]
-    audio_dir          = project_root / cfg["paths"]["data_audio"]
+    jp.migrate_legacy_job(project_root, cfg["paths"]["jobs"], job_id)
+    logs_dir           = jp.logs_dir(job_dir)
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     transcription_path = job_dir / "01_transcription.json"
     manifest_path      = job_dir / "manifest.json"
@@ -407,16 +411,16 @@ def run_diarization(job_id: str, config_path: str) -> None:
         return
 
     # ── KEY FIX: use _vocals.wav for embeddings (clean, no BGM) ──────────────
-    vocals_path = audio_dir / f"{job_id}_vocals.wav"
+    vocals_path = jp.vocals_wav(job_dir)
     if not vocals_path.exists():
         logger.warning("Vocals WAV not found — falling back to original audio")
-        vocals_path = audio_dir / f"{job_id}.wav"
+        vocals_path = jp.original_wav(job_dir)
     if not vocals_path.exists():
         logger.error("No audio found for diarization: %s", vocals_path)
         sys.exit(1)
 
     # Locate vocals audio (for speaker profiles)
-    vocals_profile_path = audio_dir / f"{job_id}_vocals.wav"
+    vocals_profile_path = jp.vocals_wav(job_dir)
     if not vocals_profile_path.exists():
         vocals_profile_path = vocals_path
 

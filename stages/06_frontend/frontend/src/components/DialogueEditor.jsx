@@ -6,7 +6,8 @@ import { WHISPER_LANGUAGES, TARGET_LANGUAGES } from '../languages'
 import TransliterationInput from './TransliterationInput'
 import { useAudio } from '../useAudio'
 import OriginalReader from './OriginalReader'
-import DubSpeedControl from './DubSpeedControl'
+import DubPanel from './DubPanel'
+import { playDubClip } from '../dubPlayback'
 
 const API        = '/api'
 const MIN_DUR_MS = 1000
@@ -18,7 +19,8 @@ export default function DialogueEditor() {
     selectedDialogueId, selectDialogue,
     currentJobId, updateDialogue, deleteDialogue,
     mergeDialogues, splitDialogue, rerunTTS, refreshAll,
-    sourceLang, targetLang, playheadMs, autoSaveEnabled, ttsRerunStatus, asrRerunStatus, rerunASR,
+    sourceLang, targetLang, playheadMs, autoSaveEnabled, ttsRerunStatus, asrRerunStatus, rerunASR, asrModel,
+    timelineMode, setTimelineMode, ttsEpoch, ttsVersion, mix,
   } = useStore()
 
   const [editText,   setEditText]   = useState('')
@@ -59,12 +61,48 @@ export default function DialogueEditor() {
   const rerunStatus = dialogue ? (ttsRerunStatus[dialogue.id] || null) : null
   const asrStatus    = dialogue ? (asrRerunStatus[dialogue.id] || null) : null
 
-  // Dub speed: the server computes the automatic length-matching value (and
-  // any manual override); while the slider is being dragged we audition the
-  // draft value, which is dropped as soon as the saved value comes back.
-  const [speedDraft, setSpeedDraft] = useState(null)
-  useEffect(() => { setSpeedDraft(null) }, [selectedDialogueId, ttsEntry?.speed, ttsEntry?.speed_manual])
-  const effSpeed = speedDraft ?? ttsEntry?.speed ?? 1
+  // INDIVIDUAL ASR model: the model used to re-transcribe THIS dialogue. Independent of the job's
+  // (global) model in the pipeline panel; remembered between sessions. Medium is the recommended default.
+  const [oneAsrModel, setOneAsrModel] = useState(() => {
+    try { const v = localStorage.getItem('dubstudio.asrModelOne'); return (v === 'large-v3' || v === 'medium') ? v : 'medium' } catch { return 'medium' }
+  })
+  const pickOneAsrModel = (m) => { setOneAsrModel(m); try { localStorage.setItem('dubstudio.asrModelOne', m) } catch {} }
+
+  // Uploaded reference voices (any audio file) — usable as the ref for any line
+  const [userRefs, setUserRefs]     = useState([])
+  const [uploading, setUploading]   = useState(false)
+  const [uploadErr, setUploadErr]   = useState('')
+  const [uploadText, setUploadText] = useState('')
+  const fileInputRef = useRef(null)
+  const loadUserRefs = () => {
+    if (!currentJobId) { setUserRefs([]); return Promise.resolve() }
+    return axios.get(`${API}/jobs/${currentJobId}/user_refs`).then(r => setUserRefs(r.data)).catch(() => setUserRefs([]))
+  }
+  useEffect(() => { loadUserRefs() }, [currentJobId])   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const uploadRef = async (file) => {
+    if (!file || !currentJobId) return
+    setUploading(true); setUploadErr('')
+    try {
+      const fd = new FormData(); fd.append('file', file); fd.append('text', uploadText)
+      const { data } = await axios.post(`${API}/jobs/${currentJobId}/user_refs`, fd)
+      await loadUserRefs()
+      setUploadText('')
+      await handleSetRef(data.value)          // use it for this dialogue right away
+    } catch (e) {
+      setUploadErr(e?.response?.data?.detail || 'Upload failed')
+    } finally { setUploading(false); if (fileInputRef.current) fileInputRef.current.value = '' }
+  }
+  const deleteUserRef = async (ref) => {
+    if (!confirm(`Remove "${ref.name}"? Lines using it go back to Auto.`)) return
+    await axios.delete(`${API}/jobs/${currentJobId}/user_refs/${ref.id}`).catch(() => {})
+    if (selRef === ref.value) setSelRef('')
+    loadUserRefs()
+  }
+  const applyRefToSpeaker = async (refVal) => {
+    if (!dialogue) return
+    await axios.post(`${API}/jobs/${currentJobId}/dialogue/set_ref_speaker`, { speaker_id: dialogue.speaker_id, ref_audio: refVal }).catch(() => {})
+  }
 
   // Load speaker-specific ref dialogues for short dialogues
   useEffect(() => {
@@ -89,7 +127,7 @@ export default function DialogueEditor() {
     setSelRef(transl?.manual_ref_audio || '')
     setDirty(false)
     touchedRef.current = new Set()
-  }, [selectedDialogueId, dialogue?.text, transl?.translation])
+  }, [selectedDialogueId, dialogue?.text, transl?.translation, transl?.manual_ref_audio])
 
   const mark = (setter, fieldName) => val => {
     setter(val)
@@ -178,14 +216,13 @@ export default function DialogueEditor() {
     // Cache-bust: after a redub, the file at this exact URL changed but the
     // URL itself didn't — re-assigning an unchanged .src is a no-op in most
     // browsers, so without this the old buffered audio would just replay.
-    au.defaultPlaybackRate = effSpeed          // survives the src change below
-    au.src = `${API}/jobs/${currentJobId}/tts_audio/${dialogue.id}?t=${Date.now()}`
-    au.load()
-    // Match the export: change duration while keeping the TTS voice pitch stable.
-    au.playbackRate = effSpeed
-    au.preservesPitch = true; au.webkitPreservesPitch = true
-    au.currentTime = 0
-    au.play().catch(() => {})
+    // Plays what the export will use: only the kept (trimmed) part, at the dub's
+    // speed, pitch preserved.
+    playDubClip(au, `${API}/jobs/${currentJobId}/tts_audio/${dialogue.id}?t=${Date.now()}`, {
+      speed: ttsEntry?.speed ?? 1, trimInMs: ttsEntry?.trim_in_ms ?? 0,
+      trimOutMs: ttsEntry?.trim_out_ms ?? null, naturalMs: ttsEntry?.natural_ms ?? 0,
+      gain: (ttsEntry?.dub_volume ?? 1) * (mix?.dub ?? 1),   // this dialogue's volume × Dubbed layer — same as the export
+    })
   }
 
   const playRefPreview = (url) => {
@@ -359,10 +396,16 @@ export default function DialogueEditor() {
               {isShort && <Badge color="#f59e0b">⚠ &lt;1s</Badge>}
               {rerunStatus==='done'   && <Badge color="#22c55e">Re-dubbed ✓</Badge>}
               {rerunStatus==='failed' && <Badge color="#ef4444">Re-dub failed</Badge>}
+              {dialogue?.asr_model && <Badge color="#a78bfa">🎙 {dialogue.asr_model}</Badge>}
               {asrStatus==='done'   && <Badge color="#22c55e">Re-transcribed ✓</Badge>}
               {asrStatus==='failed' && <Badge color="#ef4444">Re-ASR failed</Badge>}
             </div>
           </div>
+
+          {/* Dubbed view: the clip itself — waveform, trim, speed, delete */}
+          {timelineMode === 'dubbed' && tts_done && ttsEntry?.success && ttsEntry.dub_len_ms != null && (
+            <DubPanel dialogue={dialogue} entry={ttsEntry} color={color} />
+          )}
 
           {/* Speaker */}
           <div>
@@ -407,44 +450,86 @@ export default function DialogueEditor() {
           </div>
 
           {/* Ref audio — shown for short dialogues AND at TTS stage for all dialogues */}
-          {(isShort || tts_done) && (
+          {(isShort || tts_done || transl_done) && (
             <div style={{ padding:10, borderRadius:8, background: isShort?'rgba(245,158,11,0.05)':'rgba(59,130,246,0.05)', border:`1px solid ${isShort?'rgba(245,158,11,0.2)':'rgba(59,130,246,0.15)'}` }}>
               <p style={{ fontSize:10, color: isShort?'#fbbf24':'#93c5fd', marginBottom:7 }}>
                 {isShort ? '⚠ Under 1s — pick a ref audio:' : '🎙 Reference audio for this dialogue:'}
               </p>
-              {loadingRefs
-                ? <div style={{ fontSize:10, color:'#555', display:'flex', alignItems:'center', gap:5 }}><div className="spinner" style={{width:10,height:10}} /> Loading...</div>
-                : speakerRefs.length === 0
-                ? <div style={{ fontSize:10, color:'#333' }}>No other dialogues ≥1s from this speaker</div>
-                : (
-                  <div style={{ display:'flex', flexDirection:'column', gap:3, maxHeight:120, overflowY:'auto' }}>
-                    {/* Auto (use self) option */}
-                    <div onClick={() => handleSetRef('')}
+              <div style={{ display:'flex', flexDirection:'column', gap:3, maxHeight:170, overflowY:'auto' }}>
+                {/* Auto (use self) option — always available */}
+                <div onClick={() => handleSetRef('')}
+                  style={{
+                    display:'flex', alignItems:'center', gap:6, padding:'5px 8px', borderRadius:6, cursor:'pointer',
+                    background: !selRef?`${color}15`:'rgba(255,255,255,0.02)',
+                    border:`1px solid ${!selRef?color+'44':'#1e1e1e'}`,
+                  }}>
+                  <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0, background: !selRef?color:'#2a2a2a', border:`1px solid ${!selRef?color:'#333'}` }} />
+                  <span style={{ fontSize:9, color: !selRef?'#ccc':'#444', fontStyle:'italic' }}>Auto (use dialogue slice itself)</span>
+                </div>
+
+                {/* Voices the user uploaded */}
+                {userRefs.map(ref => (
+                  <div key={ref.id} onClick={() => handleSetRef(ref.value)}
+                    style={{
+                      display:'flex', alignItems:'center', gap:6, padding:'5px 8px', borderRadius:6, cursor:'pointer',
+                      background: selRef===ref.value?`${color}15`:'rgba(255,255,255,0.02)',
+                      border:`1px solid ${selRef===ref.value?color+'44':'#1e1e1e'}`,
+                    }}>
+                    <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0, background: selRef===ref.value?color:'#2a2a2a', border:`1px solid ${selRef===ref.value?color:'#333'}` }} />
+                    <span style={{ fontSize:8, color:'#f5a623', flexShrink:0 }}>📁</span>
+                    <span title={ref.name} style={{ flex:1, fontSize:9, color: selRef===ref.value?'#ccc':'#555', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{ref.name}</span>
+                    <span style={{ fontSize:8, color:'#444', flexShrink:0 }}>{(ref.duration_ms/1000).toFixed(1)}s</span>
+                    <button onClick={e => { e.stopPropagation(); playRefPreview(ref.url) }} title="Play"
+                      style={{ width:17, height:17, borderRadius:4, border:'1px solid #2a2a2a', background:'rgba(255,255,255,0.05)', color:'#555', cursor:'pointer', fontSize:8, display:'flex', alignItems:'center', justifyContent:'center' }}>▶</button>
+                    <button onClick={e => { e.stopPropagation(); deleteUserRef(ref) }} title="Remove this uploaded voice"
+                      style={{ width:17, height:17, borderRadius:4, border:'1px solid #2a2a2a', background:'rgba(255,255,255,0.05)', color:'#a55', cursor:'pointer', fontSize:8, display:'flex', alignItems:'center', justifyContent:'center' }}>✕</button>
+                  </div>
+                ))}
+
+                {/* Other lines of the same speaker */}
+                {loadingRefs
+                  ? <div style={{ fontSize:10, color:'#555', display:'flex', alignItems:'center', gap:5, padding:'4px 2px' }}><div className="spinner" style={{width:10,height:10}} /> Loading...</div>
+                  : speakerRefs.length === 0
+                  ? <div style={{ fontSize:9, color:'#333', padding:'3px 2px' }}>No other dialogues ≥1s from this speaker</div>
+                  : speakerRefs.map(ref => (
+                    <div key={ref.id} onClick={() => handleSetRef(ref.id)}
                       style={{
                         display:'flex', alignItems:'center', gap:6, padding:'5px 8px', borderRadius:6, cursor:'pointer',
-                        background: !selRef?`${color}15`:'rgba(255,255,255,0.02)',
-                        border:`1px solid ${!selRef?color+'44':'#1e1e1e'}`,
+                        background: selRef===ref.id?`${color}15`:'rgba(255,255,255,0.02)',
+                        border:`1px solid ${selRef===ref.id?color+'44':'#1e1e1e'}`,
                       }}>
-                      <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0, background: !selRef?color:'#2a2a2a', border:`1px solid ${!selRef?color:'#333'}` }} />
-                      <span style={{ fontSize:9, color: !selRef?'#ccc':'#444', fontStyle:'italic' }}>Auto (use dialogue slice itself)</span>
+                      <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0, background: selRef===ref.id?color:'#2a2a2a', border:`1px solid ${selRef===ref.id?color:'#333'}` }} />
+                      <span style={{ flex:1, fontSize:9, color: selRef===ref.id?'#ccc':'#555', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{ref.text}</span>
+                      <span style={{ fontSize:8, color:'#444', flexShrink:0 }}>{ref.duration}s</span>
+                      <button onClick={e => { e.stopPropagation(); playRefPreview(ref.url) }}
+                        style={{ width:17, height:17, borderRadius:4, border:'1px solid #2a2a2a', background:'rgba(255,255,255,0.05)', color:'#555', cursor:'pointer', fontSize:8, display:'flex', alignItems:'center', justifyContent:'center' }}>▶</button>
                     </div>
-                    {speakerRefs.map(ref => (
-                      <div key={ref.id} onClick={() => handleSetRef(ref.id)}
-                        style={{
-                          display:'flex', alignItems:'center', gap:6, padding:'5px 8px', borderRadius:6, cursor:'pointer',
-                          background: selRef===ref.id?`${color}15`:'rgba(255,255,255,0.02)',
-                          border:`1px solid ${selRef===ref.id?color+'44':'#1e1e1e'}`,
-                        }}>
-                        <div style={{ width:8, height:8, borderRadius:'50%', flexShrink:0, background: selRef===ref.id?color:'#2a2a2a', border:`1px solid ${selRef===ref.id?color:'#333'}` }} />
-                        <span style={{ flex:1, fontSize:9, color: selRef===ref.id?'#ccc':'#555', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{ref.text}</span>
-                        <span style={{ fontSize:8, color:'#444', flexShrink:0 }}>{ref.duration}s</span>
-                        <button onClick={e => { e.stopPropagation(); playRefPreview(ref.url) }}
-                          style={{ width:17, height:17, borderRadius:4, border:'1px solid #2a2a2a', background:'rgba(255,255,255,0.05)', color:'#555', cursor:'pointer', fontSize:8, display:'flex', alignItems:'center', justifyContent:'center' }}>▶</button>
-                      </div>
-                    ))}
-                  </div>
-                )
-              }
+                  ))
+                }
+              </div>
+
+              {/* Upload your own voice reference — any audio (or video) file */}
+              <div style={{ marginTop:8, paddingTop:8, borderTop:'1px solid #1a1a1a', display:'flex', flexDirection:'column', gap:5 }}>
+                <input value={uploadText} onChange={e => setUploadText(e.target.value)}
+                  placeholder="(optional) what is said in the clip — improves accuracy"
+                  className="ds-input" style={{ fontSize:10 }} />
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                  <input ref={fileInputRef} type="file" accept="audio/*,video/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.aac,.wma,.aiff,.amr,.mp4,.mkv,.webm" style={{ display:'none' }}
+                    onChange={e => uploadRef(e.target.files?.[0])} />
+                  <button onClick={() => fileInputRef.current?.click()} disabled={uploading}
+                    style={{ padding:'4px 10px', borderRadius:6, fontSize:10, fontWeight:600, cursor: uploading?'wait':'pointer', background:'rgba(245,166,35,0.1)', border:'1px solid rgba(245,166,35,0.3)', color:'#f5a623' }}>
+                    {uploading ? 'Uploading…' : '📁 Upload voice reference'}
+                  </button>
+                  {selRef?.startsWith('user:') && (
+                    <button onClick={() => applyRefToSpeaker(selRef)} title="Use this uploaded voice for every line of this speaker"
+                      style={{ padding:'4px 10px', borderRadius:6, fontSize:10, cursor:'pointer', background:'transparent', border:'1px solid #262626', color:'#888' }}>
+                      Use for all of this speaker
+                    </button>
+                  )}
+                </div>
+                {uploadErr && <div style={{ fontSize:9, color:'#f87171' }}>{uploadErr}</div>}
+                <div style={{ fontSize:8.5, color:'#3a3a3a' }}>Any audio file works (wav, mp3, m4a, flac, ogg…). 3–10 s of clean speech is best. Press 🔄 Re-dub to use it.</div>
+              </div>
             </div>
           )}
 
@@ -495,16 +580,11 @@ export default function DialogueEditor() {
               <span style={{ fontSize:9, color:'#b45309', flex:1 }}>Dialogue changed since this was synthesized — re-dub to match</span>
             </div>
           )}
-          {(ttsOk || ttsStale) && ttsEntry?.speed != null && (
-            <DubSpeedControl
-              value={effSpeed}
-              isManual={speedDraft != null || ttsEntry.speed_manual != null}
-              autoSpeed={ttsEntry.speed_auto}
-              dubMs={ttsEntry.synthesized_duration_ms}
-              originalMs={ttsEntry.original_ms}
-              onDraft={setSpeedDraft}
-              onCommit={(v) => updateDialogue(dialogue.id, 'dub_speed', v)}
-            />
+          {(ttsOk || ttsStale) && timelineMode !== 'dubbed' && (
+            <button onClick={() => setTimelineMode('dubbed')}
+              style={{ textAlign:'left', padding:'6px 9px', borderRadius:7, fontSize:10, cursor:'pointer', background:'transparent', border:'1px dashed #262626', color:'#666' }}>
+              ⚙ Speed, trim &amp; position of the dub → open the <b style={{ color:'#f5a623' }}>Dubbed</b> timeline view
+            </button>
           )}
           {ttsFail && (
             <div style={{ padding:'6px 9px', borderRadius:7, background:'rgba(239,68,68,0.06)', border:'1px solid rgba(239,68,68,0.2)', fontSize:10, color:'#f87171' }}>
@@ -537,7 +617,17 @@ export default function DialogueEditor() {
             )}
 
             {dialogue && (
-              <button onClick={() => rerunASR(dialogue.id)} disabled={asrStatus === 'running'}
+              <select value={oneAsrModel} onChange={e => pickOneAsrModel(e.target.value)} disabled={asrStatus === 'running'}
+                aria-label="Select model for this dialogue"
+                title="Select model — used only when you re-transcribe THIS dialogue (the job's model for all dialogues is set in the pipeline panel)"
+                style={{ padding:'4px 6px', borderRadius:6, fontSize:10, background:'rgba(168,85,247,0.06)', border:'1px solid rgba(168,85,247,0.25)', color:'#c084fc', cursor:'pointer' }}>
+                <option value="medium">Medium (recommended)</option>
+                <option value="large-v3">Large-v3</option>
+              </select>
+            )}
+
+            {dialogue && (
+              <button onClick={() => rerunASR(dialogue.id, oneAsrModel)} disabled={asrStatus === 'running'}
                 title="Re-run speech recognition on this dialogue's current audio slice — useful after dragging its boundaries, or to fix a mis-heard line"
                 style={{
                   padding:'5px 12px', borderRadius:6, fontSize:10, fontWeight:600, cursor: asrStatus==='running'?'not-allowed':'pointer',

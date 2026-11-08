@@ -8,6 +8,8 @@ export default function TopBar() {
   const [showJobs,setShowJobs]=useState(false),[showNew,setShowNew]=useState(false),[showLang,setShowLang]=useState(false)
   const [videos,setVideos]=useState([]),[selVideo,setSelVideo]=useState(''),[uploading,setUploading]=useState(false),[creating,setCreating]=useState(false)
   const fileRef = useRef(null)
+  const zipRef = useRef(null)
+  const [importing,setImporting]=useState(false),[importMsg,setImportMsg]=useState('')
   const openNew = async () => { const {data}=await axios.get(`${API}/input_videos`); setVideos(data); setShowNew(true); setSelVideo('') }
   const handleUpload = async e => {
     const file=e.target.files?.[0]; if(!file) return; setUploading(true)
@@ -43,6 +45,18 @@ export default function TopBar() {
           </div>}
         </div>
         <button className="btn-accent" onClick={openNew} style={{borderRadius:8,padding:'5px 13px',fontSize:11,flexShrink:0}}>+ New Job</button>
+        {/* A job folder holds EVERYTHING (video, audio tracks, all data) — zip it to share or back up, import it to continue. */}
+        <input ref={zipRef} type="file" accept=".zip,application/zip" style={{display:'none'}} onChange={async e=>{
+          const f=e.target.files?.[0]; e.target.value=''; if(!f) return
+          setImporting(true); setImportMsg('')
+          try{ const fd=new FormData(); fd.append('file',f); const {data}=await axios.post(`${API}/jobs/import_zip`,fd); await loadJobs(); await selectJob(data.job_id) }
+          catch(err){ setImportMsg(err?.response?.data?.detail||'Import failed') }
+          setImporting(false) }} />
+        <button onClick={()=>zipRef.current?.click()} disabled={importing} title="Import a job zip (made with 'Zip job') and continue where it stopped"
+          style={{borderRadius:8,padding:'5px 11px',fontSize:11,flexShrink:0,cursor:importing?'wait':'pointer',background:'rgba(255,255,255,0.04)',border:'1px solid #222',color:'#888'}}>{importing?'Importing…':'📥 Import zip'}</button>
+        <button onClick={()=>{ window.location.href=`${API}/jobs/${currentJobId}/zip` }} disabled={!currentJobId} title="Download this whole job (video, audio, all data) as one zip"
+          style={{borderRadius:8,padding:'5px 11px',fontSize:11,flexShrink:0,cursor:currentJobId?'pointer':'not-allowed',opacity:currentJobId?1:0.4,background:'rgba(255,255,255,0.04)',border:'1px solid #222',color:'#888'}}>📦 Zip job</button>
+        {importMsg&&<span style={{fontSize:10,color:'#f87171',maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={importMsg}>{importMsg}</span>}
         <div style={{flex:1}}/>
         <div style={{position:'relative',flexShrink:0}}>
           <button onClick={()=>setShowLang(v=>!v)} style={{display:'flex',alignItems:'center',gap:6,padding:'5px 10px',background:'rgba(255,255,255,0.04)',border:'1px solid #222',borderRadius:8,cursor:'pointer',fontSize:10,color:'#888'}}>
@@ -88,7 +102,7 @@ export default function TopBar() {
         <div style={{background:'#161616',border:'1px solid #252525',borderRadius:16,padding:26,width:440,boxShadow:'0 24px 64px rgba(0,0,0,0.9)'}}>
           <h2 style={{fontSize:15,fontWeight:700,marginBottom:4}}>New Dubbing Job</h2>
           <p style={{fontSize:11,color:'#444',marginBottom:20}}>Browse from your computer or select from input folder</p>
-          <input ref={fileRef} type="file" accept="video/*,.mkv,.avi,.mov,.mp4,.webm,.flv,.m4v,.ts,.wmv" style={{display:'none'}} onChange={handleUpload}/>
+          <input ref={fileRef} type="file" accept="video/*,.mkv,.avi,.mov,.mp4,.webm,.flv,.m4v,.ts,.wmv,.mpg,.mpeg,.3gp,.ogv,.m2ts,.mts,.asf,.divx,.vob,.mxf,.f4v" style={{display:'none'}} onChange={handleUpload}/>
           <button onClick={()=>fileRef.current?.click()} disabled={uploading} style={{width:'100%',padding:'10px',borderRadius:8,fontSize:11,background:'rgba(255,255,255,0.04)',border:'1px dashed #333',color:'#888',cursor:'pointer',marginBottom:12,display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
             {uploading?<><div className="spinner" style={{width:12,height:12}}/> Uploading...</>:<><span style={{fontSize:16}}>📁</span> Browse from computer (any video format)</>}
           </button>

@@ -23,6 +23,9 @@ from typing import Any, Optional
 import torch
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_shared"))
+import jobpaths as jp          # every job keeps ALL its files inside jobs/<job_id>/
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config",      required=True)
     parser.add_argument("--source_lang", required=False, default=None,
                         help="Source language code (e.g. te, hi, en) or 'auto'")
+    parser.add_argument("--asr_model", required=False, default=None,
+                        help="Whisper model for the whole job: 'medium' (recommended) or 'large-v3'. "
+                             "Chosen in the UI; overrides stages.asr.model in config.yaml")
     return parser.parse_args()
 
 
@@ -63,7 +69,8 @@ def load_config(config_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def setup_logging(job_id: str, config: dict[str, Any]) -> logging.Logger:
-    logs_dir = Path(config["paths"]["logs"])
+    jp.migrate_legacy_job(".", config["paths"]["jobs"], job_id)
+    logs_dir = jp.logs_dir(Path(config["paths"]["jobs"]) / job_id)
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{job_id}_{STAGE_NAME}.log"
     fmt      = "%(asctime)s [%(levelname)s] %(message)s"
@@ -157,12 +164,114 @@ def _is_punct_only(text: str) -> bool:
 # Transcription — KEY FIX: in_memory=True keeps model fully in GPU RAM
 # ---------------------------------------------------------------------------
 
+def _use_faster_whisper(asr_cfg: dict[str, Any]) -> bool:
+    return str(asr_cfg.get("backend", "openai-whisper")).strip().lower() in (
+        "faster-whisper", "faster_whisper", "fasterwhisper",
+    )
+
+
+def transcribe_audio_faster(
+    wav_path: Path,
+    config: dict[str, Any],
+    source_lang_override: Optional[str],
+    logger: logging.Logger,
+) -> tuple[list[dict[str, Any]], str]:
+    """EXPERIMENT — same model (large-v3), same settings, same whole-file call and
+    Whisper's own 30 s windowing as transcribe_audio(); only the engine differs
+    (faster-whisper / CTranslate2 instead of openai-whisper).
+
+    Kept identical on purpose:
+      * one transcribe() call over the whole _vocals.wav (no extra chunking)
+      * word_timestamps=True, temperature / thresholds / condition_on_previous_text from config
+      * vad_filter=False (the built-in VAD is what merged dialogues in earlier tests)
+      * beam_size=1 → greedy decoding like openai-whisper's Python API default
+        (faster-whisper's own default is beam 5, which would be a logic change)
+    Returns segments in the same dict shape openai-whisper produces, so everything
+    downstream (dedup filter, dialogue building, JSON) is untouched.
+    """
+    from faster_whisper import WhisperModel
+
+    asr_cfg     = config["stages"]["asr"]
+    model_cache = Path(config["paths"]["models_cache"])
+    model_cache.mkdir(parents=True, exist_ok=True)
+
+    device     = asr_cfg.get("device", "cuda")
+    model_name = asr_cfg.get("model", "medium")
+    compute    = asr_cfg.get("faster_whisper_compute_type", "float16" if device == "cuda" else "int8")
+    beam_size  = int(asr_cfg.get("faster_whisper_beam_size", 1))
+
+    language = source_lang_override
+    if language and language.lower() in ("auto", ""):
+        language = None
+    if not language:
+        cfg_lang = config.get("language", {}).get("source", "auto")
+        language = None if cfg_lang in ("auto", "") else cfg_lang
+
+    logger.info(
+        f"[ASR] Loading faster-whisper '{model_name}' | device={device} | compute_type={compute} | "
+        f"beam_size={beam_size} | language={'auto-detect' if language is None else language}"
+    )
+    t0 = time.time()
+    model = WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute,
+        download_root=str(model_cache),
+    )
+    logger.info(f"[ASR] Loaded in {time.time()-t0:.1f}s")
+
+    logger.info(f"[ASR] Transcribing (faster-whisper): {wav_path.name} ...")
+    t0 = time.time()
+    seg_iter, info = model.transcribe(
+        str(wav_path),
+        language=language,
+        word_timestamps=True,
+        temperature=asr_cfg.get("temperature", 0.0),
+        log_prob_threshold=asr_cfg.get("logprob_threshold", -1.0),
+        no_speech_threshold=asr_cfg.get("no_speech_threshold", 0.6),
+        condition_on_previous_text=asr_cfg.get("condition_on_previous_text", False),
+        compression_ratio_threshold=asr_cfg.get("compression_ratio_threshold", 2.4),
+        beam_size=beam_size,
+        vad_filter=False,
+    )
+
+    segments: list[dict[str, Any]] = []
+    for s in seg_iter:   # lazy generator — the real work happens while iterating
+        segments.append({
+            "start": s.start,
+            "end":   s.end,
+            "text":  s.text,
+            "avg_logprob":    s.avg_logprob,
+            "no_speech_prob": s.no_speech_prob,
+            "words": [
+                {"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
+                for w in (s.words or [])
+            ],
+        })
+
+    detected_language = getattr(info, "language", None) or language or "unknown"
+    logger.info(
+        f"[ASR] Done in {time.time()-t0:.1f}s | "
+        f"{len(segments)} segments | detected: {detected_language} (faster-whisper)"
+    )
+
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    return segments, detected_language
+
+
 def transcribe_audio(
     wav_path: Path,
     config: dict[str, Any],
     source_lang_override: Optional[str],
     logger: logging.Logger,
 ) -> tuple[list[dict[str, Any]], str]:
+    # stages.asr.backend: "openai-whisper" (default, unchanged path below) or
+    # "faster-whisper" (experiment, see transcribe_audio_faster)
+    if _use_faster_whisper(config["stages"]["asr"]):
+        return transcribe_audio_faster(wav_path, config, source_lang_override, logger)
+
     import whisper
 
     asr_cfg     = config["stages"]["asr"]
@@ -170,7 +279,7 @@ def transcribe_audio(
     model_cache.mkdir(parents=True, exist_ok=True)
 
     device     = asr_cfg.get("device", "cuda")
-    model_name = asr_cfg.get("model", "large-v3")
+    model_name = asr_cfg.get("model", "medium")
 
     # Language resolution priority:
     # 1. --source_lang arg (from job_meta.json via server.py) — highest priority
@@ -342,6 +451,7 @@ def build_transcription_json(
         "job_id":            job_id,
         "source_language":   source_lang_used or config.get("language", {}).get("source", "auto"),
         "detected_language": detected_language,
+        "asr_model":         config.get("stages", {}).get("asr", {}).get("model", "medium"),   # which Whisper model made this transcription
         "audio_path":        str(wav_path),
         "total_duration_ms": total_duration_ms,
         "dialogue_count":    len(dialogues),
@@ -361,7 +471,13 @@ def main() -> None:
     config = load_config(args.config)
     logger = setup_logging(args.job_id, config)
 
+    # The model picked in the UI for this job wins over config.yaml
+    if args.asr_model:
+        config.setdefault("stages", {}).setdefault("asr", {})["model"] = args.asr_model.strip()
+
     logger.info(f"=== Stage 01 ASR started | job_id={args.job_id} ===")
+    logger.info(f"[ASR] Model: {config['stages']['asr'].get('model', 'medium')}"
+                f"{' (chosen in the UI)' if args.asr_model else ' (from config.yaml)'}")
     if args.source_lang:
         logger.info(f"[ASR] Source language from UI: {args.source_lang}")
 
@@ -372,10 +488,9 @@ def main() -> None:
         return
 
     try:
-        audio_dir = Path(config["paths"]["data_audio"])
-
-        vocals_wav = audio_dir / f"{args.job_id}_vocals.wav"
-        full_wav   = audio_dir / f"{args.job_id}.wav"
+        job_dir    = Path(config["paths"]["jobs"]) / args.job_id
+        vocals_wav = jp.vocals_wav(job_dir)
+        full_wav   = jp.original_wav(job_dir)
 
         if vocals_wav.exists():
             wav_path = vocals_wav

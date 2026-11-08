@@ -2,26 +2,30 @@ import React from 'react'
 
 const MIN = 0.25, MAX = 2.0, STEP = 0.05
 const fmtX   = (v) => `${(+v).toFixed(2).replace(/0$/, '')}×`
-const fmtSec = (ms) => `${(ms / 1000).toFixed(1)}s`
+const fmtSec = (ms) => `${(ms / 1000).toFixed(2)}s`
 
 /**
- * Speed of one dub clip. By default the speed is chosen automatically so the
- * dub takes about as long as the original line; drag the slider to override it,
- * "Auto" puts it back. Speed changes use pitch-preserving time-stretch in the
- * export and pitch-preserving playback in the preview — no re-synthesis needed,
- * so changing it never makes a dub "stale". Extreme rates can still add artifacts.
+ * Speed of one dub clip. The default is NORMAL (1×) — nothing is sped up or
+ * slowed down unless you ask. Drag the slider to set a speed, "↺ 1×" puts it
+ * back, and "Fit to original" sets the speed that would make the kept part of
+ * the dub as long as the original line. Speed changes use pitch-preserving
+ * time-stretch in the export and pitch-preserving playback in the preview — no
+ * re-synthesis, so changing it never makes a dub "stale". Extreme rates can
+ * still add artifacts.
  *
  * Controlled by the parent: `value` is what's shown/auditioned right now
  * (a draft while dragging), `onDraft` reports drags, `onCommit` saves
- * (a number, or null to go back to automatic).
+ * (a number, or null to go back to normal speed).
  */
-export default function DubSpeedControl({ value, isManual, autoSpeed, dubMs, originalMs, onDraft, onCommit }) {
-  const fitted = dubMs > 0 ? dubMs / value : 0
-  const diff   = originalMs > 0 ? fitted - originalMs : 0
-  const fits   = originalMs > 0 && Math.abs(diff) <= originalMs * 0.06
-  const oneAt  = ((1 - MIN) / (MAX - MIN)) * 100
+export default function DubSpeedControl({ value, isManual, fitSpeed, keptMs, originalMs, onDraft, onCommit }) {
+  const finalMs = keptMs > 0 ? keptMs / value : 0
+  const diff    = originalMs > 0 ? finalMs - originalMs : 0
+  const fits    = originalMs > 0 && Math.abs(diff) <= originalMs * 0.06
+  const oneAt   = ((1 - MIN) / (MAX - MIN)) * 100
+  const canFit  = fitSpeed != null && Math.abs(fitSpeed - value) > 0.004
 
-  const commit = (e) => onCommit(parseFloat(e.currentTarget.value))
+  const commit = (e) => onCommit(parseFloat(e.currentTarget.value) === 1 ? null : parseFloat(e.currentTarget.value))
+  const btn = { fontSize: 9, padding: '2px 8px', borderRadius: 6, cursor: 'pointer', flexShrink: 0, background: 'rgba(255,255,255,0.04)', border: '1px solid #262626', color: '#888' }
 
   return (
     <div style={{ padding: '8px 10px 9px', borderRadius: 8, background: 'rgba(255,255,255,0.025)', border: '1px solid #1c1c1c' }}>
@@ -32,7 +36,7 @@ export default function DubSpeedControl({ value, isManual, autoSpeed, dubMs, ori
             fontSize: 8.5, fontWeight: 700, padding: '1px 6px', borderRadius: 8,
             background: isManual ? 'rgba(245,166,35,0.12)' : 'rgba(255,255,255,0.05)',
             color: isManual ? '#f5a623' : '#666', border: `1px solid ${isManual ? 'rgba(245,166,35,0.3)' : '#262626'}`,
-          }}>{isManual ? 'Manual' : 'Auto'}</span>
+          }}>{isManual ? 'Manual' : 'Normal'}</span>
           <span style={{ fontSize: 13, fontWeight: 700, color: '#e8e8e8', fontFamily: 'monospace', minWidth: 42, textAlign: 'right' }}>{fmtX(value)}</span>
         </div>
       </div>
@@ -45,27 +49,29 @@ export default function DubSpeedControl({ value, isManual, autoSpeed, dubMs, ori
           onPointerUp={commit} onKeyUp={commit} onBlur={commit}
           style={{ width: '100%', accentColor: '#f5a623', cursor: 'pointer', margin: 0 }}
         />
-        {/* tick at 1× so "unchanged" is easy to find */}
         <span style={{ position: 'absolute', left: `calc(${oneAt}% + ${(0.5 - oneAt / 100) * 14}px)`, bottom: 0, transform: 'translateX(-50%)', fontSize: 8, color: '#444', pointerEvents: 'none' }}>1×</span>
         <span style={{ position: 'absolute', left: 0, bottom: 0, fontSize: 8, color: '#333', pointerEvents: 'none' }}>{fmtX(MIN)}</span>
         <span style={{ position: 'absolute', right: 0, bottom: 0, fontSize: 8, color: '#333', pointerEvents: 'none' }}>{fmtX(MAX)}</span>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
         <span style={{ fontSize: 9, lineHeight: 1.5, color: '#555' }}>
-          dub {fmtSec(dubMs)} → <b style={{ color: fits ? '#4ade80' : '#fbbf24', fontWeight: 600 }}>{fmtSec(fitted)}</b> · original line {fmtSec(originalMs)}
+          kept {fmtSec(keptMs)} → <b style={{ color: fits ? '#4ade80' : '#fbbf24', fontWeight: 600 }}>{fmtSec(finalMs)}</b> · original line {fmtSec(originalMs)}
           {!fits && originalMs > 0 && (
             <span style={{ color: '#7a6a3a' }}> ({diff > 0 ? '+' : ''}{(diff / 1000).toFixed(1)}s)</span>
           )}
         </span>
-        {isManual && (
-          <button type="button" onClick={() => { onDraft(null); onCommit(null) }}
-            title={`Go back to the automatic speed (${fmtX(autoSpeed)})`}
-            style={{ fontSize: 9, padding: '2px 8px', borderRadius: 6, cursor: 'pointer', flexShrink: 0,
-              background: 'rgba(255,255,255,0.04)', border: '1px solid #262626', color: '#888' }}>
-            ↺ Auto
-          </button>
-        )}
+        <span style={{ display: 'flex', gap: 5 }}>
+          {canFit && (
+            <button type="button" onClick={() => { onDraft(null); onCommit(fitSpeed === 1 ? null : fitSpeed) }}
+              title={`Set the speed (${fmtX(fitSpeed)}) that makes this dub as long as the original line`} style={btn}>
+              ⇔ Fit to original
+            </button>
+          )}
+          {isManual && (
+            <button type="button" onClick={() => { onDraft(null); onCommit(null) }} title="Back to normal speed (1×)" style={btn}>↺ 1×</button>
+          )}
+        </span>
       </div>
     </div>
   )
